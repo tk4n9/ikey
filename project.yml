@@ -1,0 +1,57 @@
+name: iKey
+options:
+  minimumXcodeGenVersion: 2.38.0
+  deploymentTarget:
+    iOS: '17.0'
+    macOS: '13.0'
+packages:
+  IKeyCore:
+    path: Shared
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    MARKETING_VERSION: '0.1.0'
+    CURRENT_PROJECT_VERSION: '1'
+    CODE_SIGN_STYLE: Automatic
+    GENERATE_INFOPLIST_FILE: NO
+targets:
+  iKeyMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: Apps/Mac
+        excludes: [Info.plist]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ikey.mac
+        PRODUCT_NAME: iKeyMac
+        INFOPLIST_FILE: Apps/Mac/Info.plist
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: YES
+    dependencies:
+      - package: IKeyCore
+  iKeyPad:
+    type: application
+    platform: iOS
+    sources:
+      - path: Apps/iPad
+        excludes: [Info.plist]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ikey.pad
+        PRODUCT_NAME: iKeyPad
+        INFOPLIST_FILE: Apps/iPad/Info.plist
+        TARGETED_DEVICE_FAMILY: '2'
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+    dependencies:
+      - package: IKeyCore
+schemes:
+  iKeyMac:
+    build:
+      targets:
+        iKeyMac: all
+  iKeyPad:
+    build:
+      targets:
+        iKeyPad: all
