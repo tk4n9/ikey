@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 
 public struct NormalizedRect: Codable, Equatable, Sendable {
     public var x: Double
@@ -13,8 +16,11 @@ public struct NormalizedRect: Codable, Equatable, Sendable {
         width > 0 && height > 0 && x + width <= 1.0000001 && y + height <= 1.0000001
     }
     public func rect(in bounds: CGRect) -> CGRect {
-        CGRect(x: bounds.minX + x * bounds.width, y: bounds.minY + y * bounds.height,
-               width: width * bounds.width, height: height * bounds.height)
+        let originX = bounds.minX + CGFloat(x) * bounds.width
+        let originY = bounds.minY + CGFloat(y) * bounds.height
+        let scaledWidth = CGFloat(width) * bounds.width
+        let scaledHeight = CGFloat(height) * bounds.height
+        return CGRect(x: originX, y: originY, width: scaledWidth, height: scaledHeight)
     }
     public func contains(x px: Double, y py: Double) -> Bool {
         px >= x && px < x + width && py >= y && py < y + height
