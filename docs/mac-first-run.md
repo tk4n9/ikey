@@ -39,7 +39,8 @@ fails, stop and capture the first error rather than proceeding through the rest.
 6. **Install XcodeGen.** Run `brew install xcodegen`, then wait. Verify with
    `xcodegen --version`.
 
-7. **Run the shared tests.** Run `swift test --package-path Shared`. Expect
+7. **Run the shared tests.** Run
+   `xcrun swift test --package-path Shared --scratch-path "$HOME/Library/Caches/iKey/swift"`. Expect
    11 XCTest tests and zero failures. The first compile may take longer.
 
 8. **Generate the project.** Run `sh scripts/generate-project.sh`.
@@ -48,6 +49,10 @@ fails, stop and capture the first error rather than proceeding through the rest.
 9. **Check native compilation.** Run `sh scripts/check-macos.sh`, then wait.
    It builds the Mac and iPad-simulator targets without installing them. Expect
    both builds to succeed. If they fail, capture the first error.
+
+   Build products stay in this account's `~/Library/Caches/iKey`, outside Dropbox.
+   This avoids carrying absolute paths from another Mac's account. Existing
+   `Shared/.build` products are bypassed; source files do not need to be recloned.
 
 10. **Open the project.** Run `open iKey.xcodeproj`. Wait for Xcode to finish
     resolving/indexing the local package.

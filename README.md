@@ -67,7 +67,7 @@ layout is US ANSI. Keyboard input follows the Mac's active input source.
 ## Verify
 
 ```sh
-swift test --package-path Shared
+xcrun swift test --package-path Shared --scratch-path "$HOME/Library/Caches/iKey/swift"
 ./scripts/check-macos.sh
 ```
 
@@ -75,6 +75,14 @@ The second command runs shared tests, generates the project, and builds both
 native targets without signing (iPad simulator destination). It does not install
 or launch the apps. Use the [device checklist](docs/device-validation.md) before
 relying on iKey for everyday input.
+
+Build products contain absolute paths. When sharing this source folder through
+Dropbox between Macs, keep generated products outside Dropbox. The commands
+above use each account's `~/Library/Caches/iKey` for Swift products and Xcode
+DerivedData. The build script accepts an `IKEY_BUILD_ROOT` override if needed;
+choose a local, unsynced directory. Git's `.gitignore` does not control Dropbox.
+If XCTest cannot be found, select full Xcode on that Mac with
+`sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer`.
 
 ## Source layout
 
