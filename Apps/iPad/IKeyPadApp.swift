@@ -76,10 +76,10 @@ struct PadSettingsView: View {
                 Section("Mac connection") {
                     Text(model.status)
                     if !model.isConnected {
-                        if model.peers.isEmpty {
-                            Text("Start the receiver in iKey on your Mac. Keep both devices on the same Wi-Fi network and allow Local Network access.")
-                                .foregroundStyle(.secondary)
-                        } else {
+                        Text(model.discoveryStatus)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        if !model.peers.isEmpty {
                             Picker("Mac", selection: $model.selectedPeerID) {
                                 Text("Choose a Mac").tag("")
                                 ForEach(model.peers) { peer in
@@ -95,12 +95,25 @@ struct PadSettingsView: View {
                         Button(model.isConnecting ? "Connecting…" : "Connect") {
                             model.connect()
                         }
-                        .disabled(model.selectedPeerID.isEmpty || model.pairingText.isEmpty || model.isConnecting)
+                        .disabled(!model.canConnect)
+                        if let hint = model.connectionHint {
+                            Text(hint)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     if model.isConnected || model.isConnecting {
                         Button("Disconnect", role: .destructive) { model.disconnect() }
                     }
-                    Button("Refresh nearby Macs") { model.startDiscovery() }
+                    Button {
+                        model.startDiscovery()
+                    } label: {
+                        HStack {
+                            if model.isRefreshing { ProgressView().controlSize(.small) }
+                            Text(model.isRefreshing ? "Searching for Macs…" : "Refresh nearby Macs")
+                        }
+                    }
+                    .disabled(model.isRefreshing || model.isConnecting)
                 }
 
                 Section("Your MacBook photo") {

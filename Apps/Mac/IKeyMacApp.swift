@@ -41,6 +41,9 @@ private struct ReceiverPanel: View {
                     Button("Allow Input Control") { receiver.requestInputPermission() }
                     Button("Check Again") { receiver.refreshPermission() }
                 }
+                Button("Show This App in Finder") { receiver.showAppInFinder() }
+                Text("If access is already enabled, quit and reopen iKey. If needed, re-add this copy of the app in System Settings.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             HStack {

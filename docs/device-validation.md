@@ -11,6 +11,15 @@ Use a disposable document for the first input tests.
   them and retry. The UI should explain the missing access and recover.
 - Pairing: correct key connects; a different 64-character key fails; malformed
   text is rejected. A second iPad must not replace the active connection.
+- Discovery feedback: with the Mac receiver stopped, Refresh should show a
+  spinner, then a no-results message after five seconds. Start the receiver
+  afterward and confirm it appears without another refresh. Deny Local Network
+  access and confirm the denial message; grant it and refresh again. Refresh
+  must not erase an unrelated photo-import or pairing error.
+- Disabled Connect: show a hint when no Mac is discovered, none is selected, or
+  the pairing key is empty. Whitespace alone should not enable the button.
+- Mac permission feedback: after granting input control, Check Again should
+  say to start the receiver; it should not retain the old permission request.
 - Photo: import an upright and a rotated camera image. Compare every key center
   in alignment mode against where a touch is recognized. Verify after relaunch.
 - Keyboard: letters, space, Return, Delete, arrows, held repeat, Shift+A,

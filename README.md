@@ -51,6 +51,13 @@ In Xcode:
    Universal Clipboard when available. Treat it as a credential.
 5. Choose a photo and align the controls, then choose **Use touch surface**.
 
+If **Connect** is disabled, the iPad must first discover and select the Mac.
+**Refresh nearby Macs** shows search progress, then a count or a no-results
+message after five seconds; it continues listening for Macs started later.
+The Mac must say **Ready. Connect from iKey on your iPad.** If it still asks for
+input control, resolve that permission and choose **Start Receiver** first.
+**Show This App in Finder** helps locate the exact Mac app to grant access to.
+
 The Mac key changes when the app quits or when you stop the receiver and choose
 **New Key**. The iPad clears the key after pairing and does not save it. Reconnect
 explicitly after leaving the iPad app. The Mac build is an unsandboxed development

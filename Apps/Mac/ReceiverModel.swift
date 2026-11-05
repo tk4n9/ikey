@@ -53,10 +53,17 @@ final class ReceiverModel: ObservableObject {
     }
 
     func refreshPermission() {
+        let previouslyGranted = hasInputPermission
         hasInputPermission = CGPreflightPostEventAccess()
         if !hasInputPermission && isListening {
             stop(reason: "Input control permission was removed. Allow input control and start again.")
+        } else if hasInputPermission && !previouslyGranted && !isListening {
+            status = "Input control allowed. Choose Start Receiver to make this Mac discoverable."
         }
+    }
+
+    func showAppInFinder() {
+        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
     }
 
     func requestInputPermission() {

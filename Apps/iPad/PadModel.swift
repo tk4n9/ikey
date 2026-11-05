@@ -20,6 +20,8 @@ final class PadModel: ObservableObject {
     @Published var message: String?
     @Published var isConnected = false
     @Published var isConnecting = false
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var discoveryStatus = "Search for your Mac after starting its receiver."
     @Published var isSettingsPresented = true
     @Published private(set) var photo: UIImage?
     @Published private(set) var layout = DeckLayout.macBookANSI
@@ -30,10 +32,24 @@ final class PadModel: ObservableObject {
     private var stream: EventStream?
     private var heartbeat: Timer?
     private var connectTimeout: DispatchWorkItem?
+    private var discoveryTimeout: DispatchWorkItem?
     private var attemptID: UUID?
     private let store = PadStore()
 
     var inputEnabled: Bool { isConnected && !isSettingsPresented && sceneIsActive }
+
+    var canConnect: Bool {
+        !isConnecting && peers.contains(where: { $0.id == selectedPeerID }) &&
+        !pairingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var connectionHint: String? {
+        if isConnected || isConnecting { return nil }
+        if peers.isEmpty { return "Connect becomes available when your Mac appears in the list and you enter its pairing key." }
+        if !peers.contains(where: { $0.id == selectedPeerID }) { return "Choose a Mac from the list above." }
+        if pairingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Paste the pairing key from the selected Mac to enable Connect." }
+        return nil
+    }
 
     init() {
         do { layout = try store.loadLayout() ?? .macBookANSI }
@@ -42,8 +58,10 @@ final class PadModel: ObservableObject {
     }
 
     func startDiscovery() {
-        browser?.cancel()
+        stopDiscovery()
         peers = []
+        isRefreshing = true
+        discoveryStatus = "Searching for Macs…"
         let parameters = NWParameters.tcp
         parameters.includePeerToPeer = true
         let next = NWBrowser(for: .bonjour(type: IKeyService.bonjourType, domain: nil), using: parameters)
@@ -57,18 +75,62 @@ final class PadModel: ObservableObject {
             if !self.peers.contains(where: { $0.id == self.selectedPeerID }) {
                 self.selectedPeerID = self.peers.first?.id ?? ""
             }
+            if !self.peers.isEmpty {
+                self.discoveryTimeout?.cancel()
+                self.discoveryTimeout = nil
+                self.isRefreshing = false
+                self.discoveryStatus = self.peers.count == 1 ? "Found 1 Mac." : "Found \(self.peers.count) Macs."
+            } else if case .ready = next.state {
+                self.waitForDiscoveryResults(from: next)
+            }
         }
         next.stateUpdateHandler = { [weak self, weak next] state in
             guard let self, let next, self.browser === next else { return }
             switch state {
-            case .failed, .waiting:
-                self.message = "Mac discovery is unavailable. Check Wi-Fi and Local Network permission in Settings."
+            case .failed(let error), .waiting(let error):
+                self.discoveryTimeout?.cancel()
+                self.discoveryTimeout = nil
+                self.isRefreshing = false
+                if case .dns(let code) = error, code == -65570 {
+                    self.discoveryStatus = "Local Network access is blocked. Enable iKey in Settings → Privacy & Security → Local Network, then refresh."
+                } else {
+                    self.discoveryStatus = "Discovery is unavailable. Check Wi-Fi on both devices, then refresh."
+                }
             case .ready:
-                self.message = nil
+                if self.peers.isEmpty {
+                    self.waitForDiscoveryResults(from: next)
+                } else {
+                    self.isRefreshing = false
+                    self.discoveryStatus = self.peers.count == 1 ? "Found 1 Mac." : "Found \(self.peers.count) Macs."
+                }
             default: break
             }
         }
         next.start(queue: .main)
+    }
+
+    private func waitForDiscoveryResults(from browser: NWBrowser) {
+        discoveryTimeout?.cancel()
+        isRefreshing = true
+        discoveryStatus = "Searching for Macs…"
+        let timeout = DispatchWorkItem { [weak self, weak browser] in
+            guard let self, let browser, self.browser === browser, self.peers.isEmpty else { return }
+            self.isRefreshing = false
+            self.discoveryStatus = "No Macs found yet. On your Mac, start iKey's receiver and wait for Ready. Keep both devices on the same Wi-Fi network."
+            // Keep browsing: a receiver started later should still appear.
+        }
+        discoveryTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: timeout)
+    }
+
+    private func stopDiscovery() {
+        discoveryTimeout?.cancel()
+        discoveryTimeout = nil
+        browser?.stateUpdateHandler = nil
+        browser?.browseResultsChangedHandler = nil
+        browser?.cancel()
+        browser = nil
+        isRefreshing = false
     }
 
     func connect() {
@@ -149,12 +211,11 @@ final class PadModel: ObservableObject {
     func sceneActiveChanged(_ active: Bool) {
         sceneIsActive = active
         if active {
-            startDiscovery()
+            if browser == nil { startDiscovery() }
         } else {
             suspendInput()
             disconnect()
-            browser?.cancel()
-            browser = nil
+            stopDiscovery()
             isSettingsPresented = true
         }
         updateIdleTimer()
