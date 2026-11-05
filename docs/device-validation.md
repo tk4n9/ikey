@@ -30,9 +30,25 @@ Use a disposable document for the first input tests.
 - Interruptions: hold Shift or a drag, then open settings, leave the app, lock
   the iPad, disable Wi-Fi, stop the receiver, or sleep the Mac. Verify no held
   input remains after the watchdog interval; reconnect without stale presses.
-- Palm/comfort: type with resting fingers and palms. Record accidental touches,
-  missed keys, and whether the layout fits physically. This is an experiment;
-  the basic large-contact filter is not equivalent to a hardware trackpad.
+- Thumb Space: compare ten short thumb taps with ten fingertip taps. Broad
+  thumb taps should type on lift; a broad contact held on Space should not type
+  or repeat. A normal fingertip hold should still repeat. Check near key edges
+  as well as the center to distinguish alignment from contact-size filtering.
+- Palm/comfort: enable Palm rejection, start at Balanced, and type with resting
+  palms. Check accidental characters and pointer motion. Turn on touch indicators
+  to see pending/accepted/ignored contacts; try Relaxed if valid fingertips are
+  rejected and Strict if palms pass through. Record the iPad model and profile.
+- Typing lockout: start a trackpad contact while typing, stop typing, and keep
+  that contact down. It should remain ignored even after the pause expires.
+  Lift it and place a new finger to resume. A modifier-only Shift-drag should
+  work. Start typing during a drag and verify the mouse button is released.
+- Growing palm: let a finger contact spread into a broad palm before and after
+  its first accepted input; ensure held keys/buttons release and do not resume
+  until lift. Already-posted characters cannot be retracted by the filter.
+- Settings: turn Palm rejection off and back on, change sensitivity, and restart
+  the app. Verify preferences persist and active input is released on changes.
+- Limit: an ordinary-sized resting fingertip can resemble an intended press;
+  software filtering is not equivalent to a physical keyboard or hardware trackpad.
 - Responsiveness: measure touch-to-output latency on the actual Wi-Fi network;
   no latency or typing-speed claim has been measured yet.
 

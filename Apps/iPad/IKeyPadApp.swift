@@ -24,6 +24,8 @@ struct PadRootView: View {
                 resetGeneration: model.resetGeneration,
                 showRegions: false,
                 selectedKeyID: nil,
+                protection: model.touchProtection,
+                showTouchIndicators: model.showTouchIndicators,
                 onEvent: model.send
             )
             .ignoresSafeArea()
@@ -137,7 +139,34 @@ struct PadSettingsView: View {
 
                 Section("Touch controls") {
                     Text("Tap keys, or hold modifiers while tapping another key. Slide one finger on the trackpad to move the pointer. Tap for a click; tap with two fingers for a right click. Slide two fingers to scroll. Hold one finger still briefly, then move it to drag; lift to release.")
-                    Text("Touches stay assigned to their starting key or trackpad region. Large contacts are ignored as a basic accidental-touch filter. Resting fingers can still type: this first version does not offer hardware-grade palm rejection or physical key feedback.")
+                    if model.touchProtection.enabled {
+                        Text("Broader thumb taps on Space are recognized when you lift your thumb. Use a fingertip if you want to hold Space to repeat it. Pressing harder is not needed.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Section("Palm rejection") {
+                    Toggle("Palm rejection", isOn: $model.touchProtection.enabled)
+                    if model.touchProtection.enabled {
+                        Picker("Sensitivity", selection: $model.touchProtection.sensitivity) {
+                            ForEach(TouchSensitivity.allCases) { sensitivity in
+                                Text(sensitivity.title).tag(sensitivity)
+                            }
+                        }
+                        Text("Strict rejects more touches. Relaxed accepts larger finger contacts. Start with Balanced and adjust if intended taps are missed.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        Toggle("Pause trackpad while typing", isOn: $model.touchProtection.pauseTrackpadWhileTyping)
+                        Text("Helps keep resting palms from moving the pointer as you type. Modifier keys alone still allow gestures such as Shift-drag.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    Toggle("Show touch indicators", isOn: $model.showTouchIndicators)
+                    Text("Yellow means a touch is being checked, green means accepted, and red means ignored. Turn this off to see only your MacBook photo.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Text("This filtering helps with accidental touches, but a resting finger can still look like an intentional tap. It cannot exactly reproduce a physical keyboard or trackpad.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

@@ -41,7 +41,7 @@ fails, stop and capture the first error rather than proceeding through the rest.
 
 7. **Run the shared tests.** Run
    `xcrun swift test --package-path Shared --scratch-path "$HOME/Library/Caches/iKey/swift"`. Expect
-   11 XCTest tests and zero failures. The first compile may take longer.
+   XCTest tests to pass with zero failures. The first compile may take longer.
 
 8. **Generate the project.** Run `sh scripts/generate-project.sh`.
    Expected: `iKey.xcodeproj` appears in the current directory.

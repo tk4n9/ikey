@@ -15,6 +15,8 @@ touch behavior still need verification on a Mac and iPad.
 - An approximate US ANSI practice layout until you import your photograph.
 - Multitouch keys and modifiers, key repeat, pointer movement, tap to click,
   two-finger right click/scroll, and hold to drag.
+- Thumb-friendly Space taps, configurable palm filtering, and trackpad
+  suppression during typing. Optional touch indicators help tune sensitivity.
 - Mac menu-bar receiver with explicit Start/Stop and input-control permission.
 - Bonjour discovery and authenticated, encrypted TCP using a per-session pairing
   key. No account or cloud relay; no plaintext connection mode.
@@ -102,8 +104,12 @@ scripts/        project generation and native build checks
 project.yml     XcodeGen specification for both applications
 ```
 
-Limitations: glass has no physical key travel; the basic large-contact filter is
-not full palm rejection. Touch ID, power, system trackpad gestures, pressure
+See [touch behavior and palm settings](docs/touch-behavior.md) for calibration
+and the distinction between fingertip holds and broad thumb taps on Space.
+
+Limitations: glass has no physical key travel. Software palm filtering uses
+contact size, timing, and typing activity; an ordinary-sized resting fingertip
+can still look like an intentional keypress. Touch ID, power, system trackpad gestures, pressure
 clicks, media-key behavior, USB transport, and Bluetooth HID are not implemented.
 Function keys send F1–F12 virtual keycodes. Caps Lock is session-scoped; Fn sends
 a modifier flag and is not guaranteed to reproduce hardware Fn/Globe actions.

@@ -26,7 +26,28 @@ final class PadModel: ObservableObject {
     @Published private(set) var photo: UIImage?
     @Published private(set) var layout = DeckLayout.macBookANSI
     @Published private(set) var resetGeneration = 0
+    @Published var touchProtection = TouchProtectionSettings() {
+        didSet {
+            guard touchProtection != oldValue else { return }
+            if let data = try? JSONEncoder().encode(touchProtection) {
+                UserDefaults.standard.set(data, forKey: PreferenceKey.touchProtection)
+            }
+            resetTouchInput()
+        }
+    }
+    @Published var showTouchIndicators = false {
+        didSet {
+            guard showTouchIndicators != oldValue else { return }
+            UserDefaults.standard.set(showTouchIndicators, forKey: PreferenceKey.showTouchIndicators)
+            resetTouchInput()
+        }
+    }
     @Published private var sceneIsActive = true
+
+    private enum PreferenceKey {
+        static let touchProtection = "iKey.touchProtection.v1"
+        static let showTouchIndicators = "iKey.showTouchIndicators.v1"
+    }
 
     private var browser: NWBrowser?
     private var stream: EventStream?
@@ -55,6 +76,12 @@ final class PadModel: ObservableObject {
         do { layout = try store.loadLayout() ?? .macBookANSI }
         catch { message = "Saved calibration could not be loaded. The default layout is active." }
         photo = store.loadPhoto()
+        let preferences = UserDefaults.standard
+        if let data = preferences.data(forKey: PreferenceKey.touchProtection),
+           let saved = try? JSONDecoder().decode(TouchProtectionSettings.self, from: data) {
+            touchProtection = saved
+        }
+        showTouchIndicators = preferences.object(forKey: PreferenceKey.showTouchIndicators) as? Bool ?? false
     }
 
     func startDiscovery() {
@@ -257,6 +284,11 @@ final class PadModel: ObservableObject {
             try store.removePhoto()
             photo = nil
         } catch { message = "Could not remove the photo: \(error.localizedDescription)" }
+    }
+
+    private func resetTouchInput() {
+        stream?.send(.releaseAll)
+        resetGeneration += 1
     }
 
     private func updateIdleTimer() {

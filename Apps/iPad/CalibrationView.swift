@@ -25,6 +25,7 @@ struct CalibrationView: View {
             DeckSurface(image: model.photo, layout: draft, inputEnabled: false,
                         resetGeneration: 0, showRegions: true,
                         selectedKeyID: region == .key ? selectedKeyID : nil,
+                        protection: model.touchProtection, showTouchIndicators: false,
                         onEvent: { _ in })
                 .frame(height: 210)
                 .accessibilityLabel("Photo with keyboard and trackpad alignment guides")
