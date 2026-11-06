@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux (Shared tests, Apple parse)
+    runs-on: ubuntu-24.04
+    container: swift:6.2-noble
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check
+        run: sh scripts/check-linux.sh
+
+  macos:
+    name: macOS (Shared tests, both apps typecheck)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # The image's default Xcode may ship an older Swift than the linux job
+      # (6.2). Select the newest non-beta Xcode 26.x that has the iOS Simulator
+      # SDK; keep the default (with a warning) when the image has none.
+      - name: Select Xcode 26 (Swift 6.2)
+        run: |
+          picked=
+          for app in $(find /Applications -maxdepth 1 -name 'Xcode_26*.app' | grep -v -i -e beta -e release_candidate -e '_rc' | sort -r -V); do
+            if DEVELOPER_DIR="$app/Contents/Developer" xcodebuild -showsdks 2>/dev/null | grep -q iphonesimulator; then
+              sudo xcode-select -s "$app/Contents/Developer"
+              picked=$app
+              break
+            fi
+          done
+          if [ -z "$picked" ]; then
+            echo "::warning::No Xcode 26 with the iOS Simulator SDK on this image; using the default Xcode."
+          fi
+      - name: Xcode version
+        run: |
+          xcodebuild -version
+          xcrun swift --version
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Check
+        run: IKEY_BUILD_ROOT="$RUNNER_TEMP/ikey" ./scripts/check-macos.sh
+      - name: Upload Xcode logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcode-logs
+          path: ${{ runner.temp }}/ikey/DerivedData/Logs
+          if-no-files-found: ignore

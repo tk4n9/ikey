@@ -9,3 +9,5 @@ DerivedData/
 *.p12
 .env
 private/
+Config/Local.xcconfig
+.build-linux/

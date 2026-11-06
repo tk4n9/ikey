@@ -14,6 +14,7 @@ public enum InputEvent: Codable, Equatable, Sendable {
     public static let supportedKeyCodes: Set<UInt16> = Set(UInt16(0)...UInt16(50)).union([
         51, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
         65, 67, 69, 71, 75, 76, 78, 81, 82, 83, 84, 85, 86, 87, 88, 89, 91, 92,
+        93, 94, 95, 102, 104, // JIS: Yen, Underscore, keypad comma, Eisu, Kana
         96, 97, 98, 99, 100, 101, 103, 105, 106, 107, 109, 111, 113, 114,
         115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126
     ])

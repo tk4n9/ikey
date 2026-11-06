@@ -18,12 +18,15 @@ targets:
   iKeyMac:
     type: application
     platform: macOS
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
     sources:
       - path: Apps/Mac
         excludes: [Info.plist]
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.ikey.mac
+        PRODUCT_BUNDLE_IDENTIFIER: '$(IKEY_BUNDLE_ID_PREFIX).mac'
         PRODUCT_NAME: iKeyMac
         INFOPLIST_FILE: Apps/Mac/Info.plist
         ENABLE_APP_SANDBOX: NO
@@ -33,12 +36,15 @@ targets:
   iKeyPad:
     type: application
     platform: iOS
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
     sources:
       - path: Apps/iPad
         excludes: [Info.plist]
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.ikey.pad
+        PRODUCT_BUNDLE_IDENTIFIER: '$(IKEY_BUNDLE_ID_PREFIX).pad'
         PRODUCT_NAME: iKeyPad
         INFOPLIST_FILE: Apps/iPad/Info.plist
         TARGETED_DEVICE_FAMILY: '2'

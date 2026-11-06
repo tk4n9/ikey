@@ -1,0 +1,19 @@
+// Build settings shared by iKeyMac and iKeyPad (project.yml configFiles).
+//
+// Stable signing: create Config/Local.xcconfig (ignored by Git, survives
+// project regeneration) with your Apple Development team, for example:
+//
+//   DEVELOPMENT_TEAM = ABCDE12345
+//   CODE_SIGN_IDENTITY = Apple Development
+//   // Only if com.ikey.* is unavailable to your team:
+//   // IKEY_BUNDLE_ID_PREFIX = com.yourname.ikey
+//
+// Every rebuild is then signed with the same certificate, so macOS keeps the
+// iKeyMac Accessibility grant and Keychain access instead of prompting again
+// as it does for ad-hoc signatures. Without Local.xcconfig the apps build as
+// before (choose a team in Xcode; it is lost when the project is regenerated).
+
+// Bundle identifiers are $(IKEY_BUNDLE_ID_PREFIX).mac and $(IKEY_BUNDLE_ID_PREFIX).pad.
+IKEY_BUNDLE_ID_PREFIX = com.ikey
+
+#include? "Local.xcconfig"
