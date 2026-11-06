@@ -48,10 +48,29 @@ public struct IPadDisplaySpec: Codable, Equatable, Sendable {
     }
 }
 
-/// User adjustment of the drawn deck relative to the reference placement
-/// (iPad centred left-right, front edge flush with the deck front).
+/// User adjustment of the drawn deck relative to a reference placement, by default `.screenCentred`.
+///
+/// The deck is a rigid 1:1 body: the offsets only translate it. `scale` is the plan's small ppm
+/// calibration (0.99...1.01) and the only size change; nothing fits or zooms the deck on a supported
+/// 13-inch iPad.
 public struct DeckPlacement: Codable, Equatable, Sendable {
-    /// Position of the iPad's screen centre relative to the reference, in deck mm (+x right, +y toward the hinge).
+    /// Where the deck sits on screen when both offsets are zero.
+    public enum Reference: String, Codable, CaseIterable, Sendable {
+        /// The default. Horizontally the key field is centred on the screen; it is wider than a 13-inch
+        /// screen, so its outer caps are clipped symmetrically (and stay hittable to the screen edge).
+        /// Vertically the span from the top of the function row (`DeckSpec.functionRowTopY`) to the
+        /// bottom of the trackpad (`trackpad.minY`) is centred within the screen height; if it is taller
+        /// than the screen, the top of the function row sits on the top screen edge and the trackpad
+        /// bottom is clipped.
+        case screenCentred
+        /// Physical-overlay reference: iPad centred left-right on the deck (D x 0), front edge flush with
+        /// the deck front, so the screen centre shows D (0, bezelY + activeHeight / 2). Kept for the
+        /// optional position check and as a regression reference; not the default.
+        case frontFlush
+    }
+
+    /// Position of the iPad's screen centre relative to the reference, in deck mm (+x right, +y toward
+    /// the hinge): +x moves the drawn deck left on screen, +y moves it down.
     public var offsetXmm: Double = 0
     public var offsetYmm: Double = 0
     public var scale: Double = 1
@@ -91,26 +110,59 @@ public struct DeckProjection: Equatable, Sendable {
     private let anchorX: Double
     private let anchorY: Double
 
-    /// True-scale projection: ppm = landscape width / active width x scale. The screen centre shows
-    /// D (offsetX, offsetY + bezelY + activeHeight / 2).
-    /// The placement is not range-clamped here (callers normally pass `placement.clamped(for:)`), but a
-    /// non-finite offset is treated as 0 and a non-finite or non-positive scale as 1, so a bad stored
-    /// or preview placement still draws at true scale instead of producing NaN points.
+    /// True-scale projection of the default deck (`MacBookAirModel.defaultModel`, the M4/M5 Air, whose
+    /// geometry equals the 2022 preset) at the default `.screenCentred` reference. Equivalent to
+    /// `init(display:spec:screenSize:viewOriginInScreen:placement:reference:)` with that spec; pass
+    /// `spec:` explicitly for the M1 deck, whose function row and trackpad sit differently.
     public init(display: IPadDisplaySpec, screenSize: CGSize, viewOriginInScreen: CGPoint = .zero,
                 placement: DeckPlacement = .init()) {
+        self.init(display: display, spec: MacBookAirModel.defaultModel.spec, screenSize: screenSize,
+                  viewOriginInScreen: viewOriginInScreen, placement: placement, reference: .screenCentred)
+    }
+
+    /// True-scale projection: ppm = landscape width / active width x scale (1 mm on the glass is 1 mm
+    /// of MacBook). The screen centre shows the reference centre plus (offsetX, offsetY):
+    /// - `.screenCentred`: (keyField.midX, (functionRowTopY + trackpad.minY) / 2) when that span fits the
+    ///   screen height h / ppm, else (keyField.midX, functionRowTopY - h / ppm / 2).
+    /// - `.frontFlush`: (0, bezelY + activeHeight / 2).
+    /// Width and height are the landscape long and short sides of `screenSize`, so portrait-reported
+    /// bounds give the same projection. The placement is not range-clamped here (callers normally pass
+    /// `placement.clamped(for:)`), but a non-finite offset is treated as 0 and a non-finite or
+    /// non-positive scale as 1, so a bad stored or preview placement still draws at true scale instead
+    /// of producing NaN points.
+    public init(display: IPadDisplaySpec, spec: DeckSpec, screenSize: CGSize, viewOriginInScreen: CGPoint = .zero,
+                placement: DeckPlacement = .init(), reference: DeckPlacement.Reference = .screenCentred) {
         let w = Double(max(screenSize.width, screenSize.height))
         let h = Double(min(screenSize.width, screenSize.height))
         let offsetX = placement.offsetXmm.isFinite ? placement.offsetXmm : 0
         let offsetY = placement.offsetYmm.isFinite ? placement.offsetYmm : 0
         let scale = placement.scale.isFinite && placement.scale > 0 ? placement.scale : 1
-        self.init(isTrueScale: true,
-                  ppm: w / display.activeWidth * scale,
-                  anchorMM: MMPoint(x: offsetX, y: offsetY + display.bezelY + display.activeHeight / 2),
+        let ppm = Self.sanitisedPPM(w / display.activeWidth * scale)
+        let centre: MMPoint
+        switch reference {
+        case .screenCentred:
+            centre = Self.screenCentredCentre(spec: spec, ppm: ppm, screenHeight: h)
+        case .frontFlush:
+            centre = MMPoint(x: 0, y: display.bezelY + display.activeHeight / 2)
+        }
+        self.init(isTrueScale: true, ppm: ppm,
+                  anchorMM: MMPoint(x: centre.x + offsetX, y: centre.y + offsetY),
                   screenSize: (w, h), viewOrigin: viewOriginInScreen)
     }
 
-    /// Scaled fallback for windowed, rotated or unknown screens: the keyboard well and trackpad
-    /// fill the view, centred. Deliberately uses the view's actual width and height (not the
+    /// Deck mm shown at the screen centre for the `.screenCentred` reference with zero offsets.
+    static func screenCentredCentre(spec: DeckSpec, ppm: Double, screenHeight: Double) -> MMPoint {
+        let top = spec.functionRowTopY, bottom = spec.trackpad.minY
+        let halfScreenMM = (screenHeight.isFinite ? max(screenHeight, 0) : 0) / 2 / ppm
+        let y = top - bottom <= 2 * halfScreenMM ? (top + bottom) / 2 : top - halfScreenMM
+        return MMPoint(x: spec.keyField.midX, y: y)
+    }
+
+    private static func sanitisedPPM(_ ppm: Double) -> Double { ppm.isFinite && ppm > 0 ? ppm : 1 }
+
+    /// Scaled fallback for windowed, rotated or unknown screens (never used full screen on a supported
+    /// 13-inch iPad): the keyboard well and trackpad fill the view, centred, so the whole function
+    /// row and trackpad are always visible. Deliberately uses the view's actual width and height (not the
     /// landscape max/min sides used by the true-scale init, which would draw a portrait view's deck
     /// wider than the view) and the spec's own `well.width` (279.6 mm on 2022/2025, 279.58 on M1):
     /// ppm = min(width / well.width, height / (well.maxY - trackpad.minY)); D x 0 maps to the
@@ -128,7 +180,7 @@ public struct DeckProjection: Equatable, Sendable {
     private init(isTrueScale: Bool, ppm: Double, anchorMM: MMPoint, screenSize: (w: Double, h: Double), viewOrigin: CGPoint) {
         self.isTrueScale = isTrueScale
         // A zero-sized view (before layout) or a zero scale maps 1 pt per mm so nothing becomes NaN.
-        self.pointsPerMM = ppm.isFinite && ppm > 0 ? ppm : 1
+        self.pointsPerMM = Self.sanitisedPPM(ppm)
         self.anchorMM = anchorMM
         self.anchorX = (screenSize.w.isFinite ? screenSize.w : 0) / 2 - Double(viewOrigin.x)
         self.anchorY = (screenSize.h.isFinite ? screenSize.h : 0) / 2 - Double(viewOrigin.y)
@@ -137,6 +189,8 @@ public struct DeckProjection: Equatable, Sendable {
     /// Points per mm, isotropic.
     public var ppm: Double { pointsPerMM }
     public var mmPerPoint: Double { 1 / pointsPerMM }
+    /// Deck mm (frame D) shown at the centre of the screen, placement offsets included.
+    public var screenCentreMM: MMPoint { anchorMM }
 
     public func point(_ p: MMPoint) -> CGPoint {
         CGPoint(x: anchorX + (p.x - anchorMM.x) * pointsPerMM,
@@ -190,10 +244,19 @@ public struct ProjectionResolution: Equatable, Sendable {
 }
 
 /// Decides true scale from scene geometry rather than from the screen alone, so a resizable or
-/// rotated scene falls back to a scaled drawing.
+/// rotated scene falls back to a scaled drawing (with a banner). Full screen on a known 13-inch iPad is
+/// always true scale: the placement only translates the deck.
 public enum DeckGeometryResolver {
+    /// Uses the default `.screenCentred` reference.
     public static func resolve(spec: DeckSpec, env: ScreenEnvironment, overrideID: String?,
                                placement: DeckPlacement) -> ProjectionResolution {
+        resolve(spec: spec, env: env, overrideID: overrideID, placement: placement, reference: .screenCentred)
+    }
+
+    /// `reference` applies only to the full-screen (true-scale) result; windowed and unknown-device
+    /// results use `DeckProjection.fitting`, which ignores the placement.
+    public static func resolve(spec: DeckSpec, env: ScreenEnvironment, overrideID: String?,
+                               placement: DeckPlacement, reference: DeckPlacement.Reference) -> ProjectionResolution {
         let display = overrideID.flatMap { IPadDisplaySpec.preset(id: $0) }
             ?? IPadDisplaySpec.preset(forMachine: env.machineID)
             ?? IPadDisplaySpec.detect(nativeLandscapePixels: env.nativePixels)
@@ -212,9 +275,9 @@ public enum DeckGeometryResolver {
         guard isFullScreen else {
             return ProjectionResolution(display: display, fit: .windowed, projection: fitting)
         }
-        let projection = DeckProjection(display: display, screenSize: size,
+        let projection = DeckProjection(display: display, spec: spec, screenSize: size,
                                         viewOriginInScreen: env.viewOriginInWindow,
-                                        placement: placement.clamped(for: spec.model))
+                                        placement: placement.clamped(for: spec.model), reference: reference)
         return ProjectionResolution(display: display, fit: .fullScreen, projection: projection)
     }
 }

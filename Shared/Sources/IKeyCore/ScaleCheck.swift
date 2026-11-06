@@ -1,7 +1,11 @@
 import Foundation
 
-/// Data for Fit & Size: rulers, the ID-1 card, key spans (scale) and reference distances measured on
-/// the real MacBook (position).
+/// Data for Fit & Size: rulers, the ID-1 card and key spans (the true-scale check, part of setup), plus
+/// reference distances measured on the real MacBook (the position check, optional/advanced).
+///
+/// The overlay of the iPad on the MacBook is a conceptual yardstick: the default placement is
+/// screen-centred (`DeckPlacement.Reference.screenCentred`), not front-flush. The scale checks hold at
+/// any placement because placement only translates the 1:1 deck.
 public enum ScaleCheck {
     public struct Tick: Equatable, Sendable {
         public enum Kind: Sendable { case mm, half, cm }
@@ -82,6 +86,11 @@ public enum ScaleCheck {
 
     /// Shifts the placement by the mean disagreement per axis between measured and expected
     /// distances (relative to `current`). Unknown ids and non-finite values are ignored.
+    ///
+    /// The shift is relative, so it applies to either reference, but it restores physical registration
+    /// only for an iPad lying front-flush on the MacBook with the deck drawn at `.frontFlush`. At the
+    /// default `.screenCentred` reference it is an advanced option; `maxResidualMM` stays meaningful
+    /// either way as a sign that the preset does not match this MacBook.
     ///
     /// The measured distances do not depend on the current placement, so the shift is not
     /// idempotent: pass the placement from before any earlier suggestion was applied, or applying

@@ -9,8 +9,11 @@ import Foundation
 // orthographic MacBook Air M4 render scaled to the 304.1 mm specified width (high confidence).
 // The placement of the key field, keyboard well and trackpad on the deck is ±0.5 mm (medium);
 // corner radii are low confidence; the M1 (2020) placement is an estimate. Values asserted by the
-// XCTests are regression locks on these constants, not evidence of fidelity: only the on-device
-// position check establishes that.
+// XCTests are regression locks on these constants, not evidence of fidelity.
+//
+// The deck is a rigid 1:1 body: every cap, gap, the keyboard-to-trackpad distance and the trackpad
+// are drawn at these millimetres at the iPad's real points per mm. Placement on screen only
+// translates it (see `DeckProjection`); on a supported 13-inch iPad it is never scaled to fit.
 
 public struct MMPoint: Codable, Equatable, Sendable {
     public var x, y: Double
@@ -53,6 +56,10 @@ public enum MacBookAirModel: String, Codable, CaseIterable, Sendable {
     }
 
     public var isEstimate: Bool { self == .air13_2020 }
+
+    /// The preset used wherever a default is chosen (no Mac connected yet, unknown `hw.model`,
+    /// previews): the MacBook Air M4/M5. Its deck geometry equals the 2022 (M2/M3) preset.
+    public static let defaultModel: MacBookAirModel = .air13_2025
 
     public var spec: DeckSpec {
         switch self {
@@ -105,6 +112,12 @@ public struct DeckSpec: Equatable, Sendable {
         self.trackpad = trackpad; self.trackpadCornerRadius = trackpadCornerRadius
         self.keycapCornerRadius = keycapCornerRadius; self.keys = keys; self.voids = voids
         self.provenance = provenance
+    }
+
+    /// D y of the top edge of the function row (199.87 mm on 2022/2025, 193.04 mm on M1). The default
+    /// screen-centred placement centres the span from here down to `trackpad.minY` on screen.
+    public var functionRowTopY: Double {
+        keys.filter { $0.row == 0 }.map(\.cap.maxY).max() ?? keyField.maxY
     }
 
     public func key(id: String) -> KeySpec? { keys.first { $0.id == id } }

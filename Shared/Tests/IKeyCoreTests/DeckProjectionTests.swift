@@ -5,9 +5,11 @@ import CoreGraphics
 import XCTest
 @testable import IKeyCore
 
-// Worked values are regression locks on the constants and the projection formula.
+// Worked values are regression locks on the constants and the projection formula. The default
+// placement is screen-centred; the front-flush physical-overlay placement is kept as an explicit
+// reference (`reference: .frontFlush`) with its original worked values.
 final class DeckProjectionTests: XCTestCase {
-    private let spec = MacBookAirModel.air13_2022.spec
+    private let spec = MacBookAirModel.defaultModel.spec
     private let proScreen = CGSize(width: 1376, height: 1032)
     private let airScreen = CGSize(width: 1366, height: 1024)
 
@@ -19,10 +21,176 @@ final class DeckProjectionTests: XCTestCase {
 
     private func key(_ id: String) throws -> KeySpec { try XCTUnwrap(spec.key(id: id)) }
 
-    func testProWorkedValues() throws {
-        let p = DeckProjection(display: .pro13, screenSize: proScreen)
+    // MARK: - Screen-centred default
+
+    func testScreenCentredProWorkedValues() throws {
+        let p = DeckProjection(display: .pro13, spec: spec, screenSize: proScreen)
         XCTAssertTrue(p.isTrueScale)
         XCTAssertEqual(p.ppm, 5.18873, accuracy: 0.00001)
+        // Function row top 199.87 to trackpad bottom 5.08 (194.79 mm) centred in 198.89 mm of screen.
+        XCTAssertEqual(p.screenCentreMM.x, 0, accuracy: 1e-9)
+        XCTAssertEqual(p.screenCentreMM.y, 102.475, accuracy: 1e-9)
+        let esc = p.rect(try key("esc").cap)
+        assertPoint(esc.origin, -22.80, 10.64)
+        assertPoint(p.point(MMPoint(x: spec.keyField.maxX, y: spec.keyField.minY)), 1398.80, 578.55)
+        let pad = p.rect(spec.trackpad)
+        assertPoint(pad.origin, 355.40, 606.00)
+        assertPoint(CGPoint(x: pad.maxX, y: pad.maxY), 1020.60, 1021.36)
+        // Equal margins above the function row and below the trackpad (2.05 mm each).
+        XCTAssertEqual(Double(esc.minY), Double(1032 - pad.maxY), accuracy: 1e-9)
+        XCTAssertEqual(Double(esc.minY) / p.ppm, 2.051, accuracy: 0.001)
+        // Symmetric horizontal clip of 4.395 mm per side.
+        let left = p.point(MMPoint(x: spec.keyField.minX, y: 100)).x
+        let right = p.point(MMPoint(x: spec.keyField.maxX, y: 100)).x
+        XCTAssertEqual(Double(-left), Double(right - 1376), accuracy: 1e-9)
+        XCTAssertEqual(Double(-left) / p.ppm, 4.395, accuracy: 0.001)
+        // The defaulted-spec initialiser and portrait-reported bounds give the same projection.
+        XCTAssertEqual(DeckProjection(display: .pro13, screenSize: proScreen), p)
+        XCTAssertEqual(DeckProjection(display: .pro13, spec: spec, screenSize: CGSize(width: 1032, height: 1376)), p)
+        XCTAssertEqual(DeckProjection(display: .pro13, spec: MacBookAirModel.air13_2022.spec, screenSize: proScreen), p)
+    }
+
+    func testScreenCentredAirWorkedValues() throws {
+        let p = DeckProjection(display: .air13, spec: spec, screenSize: airScreen)
+        XCTAssertEqual(p.ppm, 5.18859, accuracy: 0.00001)
+        XCTAssertEqual(p.screenCentreMM.y, 102.475, accuracy: 1e-9)
+        let esc = p.rect(try key("esc").cap)
+        assertPoint(esc.origin, -27.78, 6.66)
+        assertPoint(p.point(MMPoint(x: spec.keyField.maxX, y: spec.keyField.minY)), 1393.78, 574.55)
+        let pad = p.rect(spec.trackpad)
+        assertPoint(pad.origin, 350.41, 602.00)
+        assertPoint(CGPoint(x: pad.maxX, y: pad.maxY), 1015.59, 1017.34)
+        XCTAssertEqual(Double(esc.minY), Double(1024 - pad.maxY), accuracy: 1e-9)
+        XCTAssertEqual(Double(esc.minY) / p.ppm, 1.283, accuracy: 0.001)
+        let left = p.point(MMPoint(x: spec.keyField.minX, y: 100)).x
+        XCTAssertEqual(Double(-left) / p.ppm, 5.355, accuracy: 0.001)
+        XCTAssertEqual(DeckProjection(display: .air13, screenSize: airScreen), p)
+    }
+
+    func testScreenCentredShowsWholeFunctionRowAndTrackpad() {
+        for model in MacBookAirModel.allCases {
+            let s = model.spec
+            for (display, size) in [(IPadDisplaySpec.pro13, proScreen), (.air13, airScreen)] {
+                let p = DeckProjection(display: display, spec: s, screenSize: size)
+                let fnTop = p.point(MMPoint(x: 0, y: s.functionRowTopY)).y
+                let padBottom = p.point(MMPoint(x: 0, y: s.trackpad.minY)).y
+                XCTAssertGreaterThan(Double(fnTop), 0, "\(model) \(display.id)")
+                XCTAssertLessThan(Double(padBottom), Double(size.height), "\(model) \(display.id)")
+                XCTAssertEqual(Double(fnTop), Double(size.height - padBottom), accuracy: 1e-9, "\(model) \(display.id)")
+                XCTAssertEqual(Double(p.point(MMPoint(x: s.keyField.midX, y: 0)).x), Double(size.width) / 2, accuracy: 1e-9)
+            }
+        }
+        // M1: function row top 193.04, trackpad bottom 6.00.
+        let m1 = DeckProjection(display: .pro13, spec: MacBookAirModel.air13_2020.spec, screenSize: proScreen)
+        XCTAssertEqual(m1.screenCentreMM.y, 99.52, accuracy: 1e-9)
+    }
+
+    func testScreenCentredClipsTrackpadWhenSpanDoesNotFit() {
+        // A short screen (900 pt at the Air's ppm is 173.45 mm < 194.79 mm): function row on the top edge.
+        let p = DeckProjection(display: .air13, spec: spec, screenSize: CGSize(width: 1366, height: 900))
+        XCTAssertEqual(Double(p.point(MMPoint(x: 0, y: spec.functionRowTopY)).y), 0, accuracy: 1e-9)
+        XCTAssertEqual(p.screenCentreMM.y, 113.1412, accuracy: 0.0001)
+        XCTAssertEqual(Double(p.point(MMPoint(x: 0, y: spec.trackpad.minY)).y), 1010.69, accuracy: 0.05)
+        XCTAssertEqual(p.ppm, 1366 / IPadDisplaySpec.air13.activeWidth, accuracy: 1e-12) // still 1:1
+        // With a view origin the function row sits on the screen's top edge, not the view's.
+        let inset = DeckProjection(display: .air13, spec: spec, screenSize: CGSize(width: 1366, height: 900),
+                                   viewOriginInScreen: CGPoint(x: 0, y: 30))
+        XCTAssertEqual(Double(inset.point(MMPoint(x: 0, y: spec.functionRowTopY)).y), -30, accuracy: 1e-9)
+    }
+
+    func testNudgesAreOffsetsFromCentredDefault() {
+        let base = DeckProjection(display: .pro13, spec: spec, screenSize: proScreen)
+        let nudged = DeckProjection(display: .pro13, spec: spec, screenSize: proScreen,
+                                    placement: DeckPlacement(offsetXmm: -2.5, offsetYmm: 4))
+        XCTAssertEqual(nudged.screenCentreMM.x, base.screenCentreMM.x - 2.5, accuracy: 1e-9)
+        XCTAssertEqual(nudged.screenCentreMM.y, base.screenCentreMM.y + 4, accuracy: 1e-9)
+        XCTAssertEqual(nudged.ppm, base.ppm)
+        let flushBase = DeckProjection(display: .pro13, spec: spec, screenSize: proScreen, reference: .frontFlush)
+        let flushNudged = DeckProjection(display: .pro13, spec: spec, screenSize: proScreen,
+                                         placement: DeckPlacement(offsetXmm: -2.5, offsetYmm: 4), reference: .frontFlush)
+        XCTAssertEqual(flushNudged.screenCentreMM.y - flushBase.screenCentreMM.y, 4, accuracy: 1e-9)
+        XCTAssertEqual(DeckPlacement.Reference.allCases, [.screenCentred, .frontFlush])
+        XCTAssertEqual(MacBookAirModel.defaultModel, .air13_2025)
+    }
+
+    // MARK: - 1:1 lock-in (true physical size at the device's real ppm)
+
+    /// Every expectation is mm (hard-coded MacBook Air M4/M5 dimensions) x the device's real points per
+    /// mm (landscape points / active width), tolerance 0.01 pt; drawn through the resolver's full-screen
+    /// path at default and nudged placements.
+    func testOneToOneDimensionsProAndAir() throws {
+        let cases: [(IPadDisplaySpec, ScreenEnvironment, Double)] = [
+            (.pro13, ScreenEnvironment(machineID: "iPad16,5", nativePixels: CGSize(width: 2752, height: 2064),
+                                       nativeScale: 2, windowPoints: proScreen), 1376 / 265.19),
+            (.air13, ScreenEnvironment(machineID: "iPad15,5", nativePixels: CGSize(width: 2732, height: 2048),
+                                       nativeScale: 2, windowPoints: airScreen), 1366 / 263.27)
+        ]
+        let tol = 0.01
+        for (display, env, ppm) in cases {
+            for placement in [DeckPlacement(), DeckPlacement(offsetXmm: 5, offsetYmm: -8), DeckPlacement(offsetXmm: -3.3, offsetYmm: 7.1)] {
+                let r = DeckGeometryResolver.resolve(spec: spec, env: env, overrideID: nil, placement: placement)
+                let label = "\(display.id) \(placement)"
+                XCTAssertEqual(r.fit, .fullScreen, label)
+                XCTAssertTrue(r.isTrueScale, label)
+                XCTAssertEqual(r.projection.ppm, ppm, accuracy: 1e-9, label)
+                let deck = ResolvedDeck(spec: spec, projection: r.projection)
+                func rect(_ id: String) throws -> CGRect { try XCTUnwrap(deck.keys.first { $0.id == id }, id).rect }
+                func eq(_ points: CGFloat, _ mm: Double, _ what: String, line: UInt = #line) {
+                    XCTAssertEqual(Double(points), mm * ppm, accuracy: tol, "\(label) \(what)", line: line)
+                }
+                // Column pitch 19.00 mm and cap gap 1.52 mm along every 1u run of the letter rows.
+                for row in [["q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "lbracket", "rbracket", "backslash"],
+                            ["a", "s", "d", "f", "g", "h", "j", "k", "l", "semicolon", "quote"],
+                            ["z", "x", "c", "v", "b", "n", "m", "comma", "period", "slash"],
+                            ["d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9", "d0", "minus", "equal"],
+                            ["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "touchid"]] {
+                    for (a, b) in zip(row, row.dropFirst()) {
+                        let ra = try rect(a), rb = try rect(b)
+                        eq(rb.minX - ra.minX, 19.00, "pitch \(a)-\(b)")
+                        eq(rb.minX - ra.maxX, 1.52, "gap \(a)-\(b)")
+                    }
+                }
+                // Row pitch 18.50 mm and row gap 1.55 mm, function row to bottom row.
+                let column = ["f1", "d1", "q", "a", "z", "option_l"]
+                for (a, b) in zip(column, column.dropFirst()) {
+                    let ra = try rect(a), rb = try rect(b)
+                    eq(rb.minY - ra.minY, 18.50, "row pitch \(a)/\(b)")
+                    eq(rb.minY - ra.maxY, 1.55, "row gap \(a)/\(b)")
+                }
+                // Cap sizes.
+                for id in ["a", "j", "f5", "touchid", "fn"] {
+                    eq(try rect(id).width, 17.48, "\(id) width"); eq(try rect(id).height, 16.95, "\(id) height")
+                }
+                eq(try rect("esc").width, 26.98, "esc width")
+                eq(try rect("tab").width, 26.98, "tab width")
+                eq(try rect("capslock").width, 31.73, "caps width")
+                eq(try rect("shift_l").width, 41.23, "shift width")
+                eq(try rect("command_l").width, 22.23, "command width")
+                eq(try rect("space").width, 93.48, "space width")
+                for id in ["left", "down", "right"] { eq(try rect(id).height, 8.55, "\(id) height") }
+                eq(try rect("up").height, 8.40, "up height")
+                for id in ["left", "up", "down", "right"] { eq(try rect(id).width, 17.48, "\(id) width") }
+                eq(try rect("down").minY - (try rect("up")).maxY, 0, "up/down touch")
+                // Trackpad 128.20 x 80.05 mm, 5.29 mm below the space bar, centred under it.
+                eq(deck.trackpad.width, 128.20, "trackpad width")
+                eq(deck.trackpad.height, 80.05, "trackpad height")
+                eq(deck.trackpad.minY - (try rect("space")).maxY, 5.29, "keyboard to trackpad")
+                eq(deck.trackpad.midX - (try rect("command_l")).minX, 79.99, "trackpad centre vs left command")
+                eq(deck.trackpad.minX - (try rect("a")).minX, 39.64, "A to trackpad left edge")
+                // Key field width 273.98 mm.
+                eq(try rect("delete").maxX - (try rect("esc")).minX, 273.98, "key field width")
+            }
+        }
+    }
+
+    // MARK: - Front-flush reference (physical overlay; the former default)
+
+    func testFrontFlushReferenceProWorkedValues() throws {
+        let p = DeckProjection(display: .pro13, spec: spec, screenSize: proScreen, reference: .frontFlush)
+        XCTAssertTrue(p.isTrueScale)
+        XCTAssertEqual(p.ppm, 5.18873, accuracy: 0.00001)
+        XCTAssertEqual(p.screenCentreMM.x, 0, accuracy: 1e-9)
+        XCTAssertEqual(p.screenCentreMM.y, 8.195 + 199.14 / 2, accuracy: 1e-9)
         let esc = p.rect(try key("esc").cap)
         assertPoint(esc.origin, -22.80, 38.09)
         assertPoint(p.point(MMPoint(x: spec.keyField.maxX, y: spec.keyField.minY)), 1398.80, 606.00)
@@ -30,11 +198,19 @@ final class DeckProjectionTests: XCTestCase {
         assertPoint(pad.origin, 355.40, 633.45)
         assertPoint(CGPoint(x: pad.maxX, y: pad.maxY), 1020.60, 1048.81)
         // Portrait-reported bounds give the same landscape projection.
-        XCTAssertEqual(DeckProjection(display: .pro13, screenSize: CGSize(width: 1032, height: 1376)), p)
+        XCTAssertEqual(DeckProjection(display: .pro13, spec: spec, screenSize: CGSize(width: 1032, height: 1376),
+                                      reference: .frontFlush), p)
+        // Front flush clips 3.24 mm off the trackpad bottom; the screen-centred default does not.
+        XCTAssertGreaterThan(Double(pad.maxY), 1032)
+        // Same ppm and x as the default; only the vertical translation differs (5.29 mm).
+        let centred = DeckProjection(display: .pro13, spec: spec, screenSize: proScreen)
+        XCTAssertEqual(centred.ppm, p.ppm)
+        XCTAssertEqual(centred.screenCentreMM.x, p.screenCentreMM.x, accuracy: 1e-12)
+        XCTAssertEqual(p.screenCentreMM.y - centred.screenCentreMM.y, 5.29, accuracy: 1e-9)
     }
 
-    func testAirWorkedValues() throws {
-        let p = DeckProjection(display: .air13, screenSize: airScreen)
+    func testFrontFlushReferenceAirWorkedValues() throws {
+        let p = DeckProjection(display: .air13, spec: spec, screenSize: airScreen, reference: .frontFlush)
         XCTAssertEqual(p.ppm, 5.18859, accuracy: 0.00001)
         assertPoint(p.rect(try key("esc").cap).origin, -27.78, 32.73)
         let pad = p.rect(spec.trackpad)
@@ -59,6 +235,9 @@ final class DeckProjectionTests: XCTestCase {
             DeckProjection(display: .pro13, screenSize: proScreen),
             DeckProjection(display: .air13, screenSize: airScreen, viewOriginInScreen: CGPoint(x: 12, y: -7),
                            placement: DeckPlacement(offsetXmm: -3.2, offsetYmm: 5.5, scale: 0.995)),
+            DeckProjection(display: .pro13, spec: MacBookAirModel.air13_2020.spec, screenSize: proScreen,
+                           placement: DeckPlacement(offsetYmm: -4), reference: .frontFlush),
+            DeckProjection(display: .air13, spec: spec, screenSize: CGSize(width: 1366, height: 900)),
             DeckProjection.fitting(spec: spec, screenSize: CGSize(width: 1000, height: 800),
                                    viewOriginInScreen: CGPoint(x: 40, y: 30))
         ]
@@ -114,6 +293,13 @@ final class DeckProjectionTests: XCTestCase {
         for bad in [0.0, -1.0, .infinity] {
             let d = DeckProjection(display: .pro13, screenSize: proScreen, placement: DeckPlacement(scale: bad))
             XCTAssertEqual(d.ppm, 5.18873, accuracy: 0.00001, "scale \(bad)")
+        }
+        // Before layout (zero size): no NaN in either reference.
+        for reference in DeckPlacement.Reference.allCases {
+            let empty = DeckProjection(display: .pro13, spec: spec, screenSize: .zero, reference: reference)
+            XCTAssertEqual(empty.ppm, 1)
+            XCTAssertTrue(empty.point(p).x.isFinite && empty.point(p).y.isFinite, "\(reference)")
+            XCTAssertTrue(empty.screenCentreMM.y.isFinite)
         }
         // Finite out-of-range values are not clamped here (the resolver clamps).
         let wide = DeckProjection(display: .pro13, screenSize: proScreen, placement: DeckPlacement(offsetXmm: 20))
@@ -172,7 +358,20 @@ final class DeckProjectionTests: XCTestCase {
         XCTAssertEqual(r.fit, .fullScreen)
         XCTAssertEqual(r.display, .pro13)
         XCTAssertTrue(r.isTrueScale)
-        XCTAssertEqual(r.projection, DeckProjection(display: .pro13, screenSize: proScreen))
+        XCTAssertEqual(r.projection, DeckProjection(display: .pro13, spec: spec, screenSize: proScreen))
+        XCTAssertEqual(r.projection.screenCentreMM.y, 102.475, accuracy: 1e-9)
+        // The reference overload: front flush on request; the 4-argument form is screen-centred.
+        let flush = DeckGeometryResolver.resolve(spec: spec, env: pro, overrideID: nil, placement: .init(),
+                                                 reference: .frontFlush)
+        XCTAssertEqual(flush.projection,
+                       DeckProjection(display: .pro13, spec: spec, screenSize: proScreen, reference: .frontFlush))
+        XCTAssertEqual(DeckGeometryResolver.resolve(spec: spec, env: pro, overrideID: nil, placement: .init(),
+                                                    reference: .screenCentred), r)
+        // The resolver centres the deck it is given (the M1 deck differs).
+        let m1Spec = MacBookAirModel.air13_2020.spec
+        let m1 = DeckGeometryResolver.resolve(spec: m1Spec, env: pro, overrideID: nil, placement: .init())
+        XCTAssertEqual(m1.projection, DeckProjection(display: .pro13, spec: m1Spec, screenSize: proScreen))
+        XCTAssertEqual(m1.projection.screenCentreMM.y, 99.52, accuracy: 1e-9)
 
         let moreSpace = ScreenEnvironment(machineID: "iPad16,5", nativePixels: CGSize(width: 2064, height: 2752),
                                           nativeScale: 1.7308, windowPoints: CGSize(width: 1590, height: 1192))
@@ -186,7 +385,7 @@ final class DeckProjectionTests: XCTestCase {
                                         nativeScale: 2, windowPoints: proScreen, viewOriginInWindow: CGPoint(x: 0, y: 20))
         let s = DeckGeometryResolver.resolve(spec: spec, env: shifted, overrideID: nil,
                                              placement: DeckPlacement(offsetXmm: 30))
-        XCTAssertEqual(s.projection, DeckProjection(display: .pro13, screenSize: proScreen,
+        XCTAssertEqual(s.projection, DeckProjection(display: .pro13, spec: spec, screenSize: proScreen,
                                                     viewOriginInScreen: CGPoint(x: 0, y: 20),
                                                     placement: DeckPlacement(offsetXmm: 5)))
     }
@@ -216,6 +415,8 @@ final class DeckProjectionTests: XCTestCase {
         XCTAssertFalse(r.isTrueScale)
         XCTAssertFalse(r.projection.isTrueScale)
         XCTAssertEqual(r.projection, DeckProjection.fitting(spec: spec, screenSize: CGSize(width: 1000, height: 800)))
+        XCTAssertEqual(DeckGeometryResolver.resolve(spec: spec, env: env, overrideID: nil, placement: .init(),
+                                                    reference: .frontFlush), r)
     }
 
     func testResolverPortraitIsWindowed() {

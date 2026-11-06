@@ -23,6 +23,17 @@ public enum PipelineOutput: Equatable, Sendable {
 /// gets an up (or the caller's releaseAll after `reset`); I4 a lifted modifier's up waits
 /// while a key from its interval is unresolved; I5 resting, rejected or cancelled
 /// contacts post nothing unless already down. The Mac repeats held keys; nothing here repeats.
+///
+/// Resting modifiers (rest modes): touching a modifier posts nothing by itself. It is posted
+/// before a key that commits with it, before pointer output, or as a lone tap at lift. A held,
+/// still unposted and unused modifier rests silently (never chords) once a key contact starts
+/// resting while it is held (a thumb settling with the hands), unless it still waits for a chord:
+/// a key it applies to is unresolved, or the key that rested is one it applied to, pressed among
+/// already-resting hands (Space excepted). The stale rule rests or releases a held modifier left
+/// unused among resting hands for `staleModifier` after its landing or its last chord.
+///
+/// Tap-only codes (`TypingSettings.tapOnlyCodes`) touched during a placement burst, or held
+/// when one starts, post nothing at lift: a thumb bouncing while the hand lands is not a tap.
 public struct KeyCommitPipeline {
     /// Shift, Command, Option, Control (both sides) and fn. Caps Lock (57) is an ordinary key here.
     public static let modifierCodes: Set<UInt16> = [54, 55, 56, 58, 59, 60, 61, 62, 63]
@@ -60,12 +71,21 @@ public struct KeyCommitPipeline {
         /// applies to this one) or a foreign contact was down. nil while still isolated.
         var isolationLostAt: TimeInterval?
         var everPosted = false
+        /// At landing, at least `staleRestingContacts` other contacts were resting.
+        var landedAmongRestingHands = false
+        /// Tap-only code (an ordinary key here). With `silentLift` (touched during a placement
+        /// burst) its lift is a bounce of a settling thumb: it rests instead of tapping.
+        var tapOnly = false
+        var silentLift = false
         // Modifier timeline only.
         var burst = BurstRole.none
         var burstPartners: Set<Int> = []
         var revealDone = false
         var postedByReveal = false
-        var used = false
+        var pointerUsed = false
+        /// When a key last committed with this modifier applied.
+        var lastChordAt: TimeInterval?
+        var used: Bool { pointerUsed || lastChordAt != nil }
 
         var isModifier: Bool { policy == .modifier }
         var isHeld: Bool { liftedAt == nil }
@@ -86,7 +106,8 @@ public struct KeyCommitPipeline {
     private let restMaxTravelMM: Double
     private let burstWindow: TimeInterval
     private let chordTolerance: TimeInterval
-    private let reveal: TimeInterval
+    /// nil: held modifiers are never posted from time alone (rest modes by default).
+    private let reveal: TimeInterval?
     private let loneModifierTapMax: TimeInterval
     private let staleModifier: TimeInterval
     private let burstMinContacts: Int
@@ -111,9 +132,14 @@ public struct KeyCommitPipeline {
         restMaxTravelMM = sane(settings.restMaxTravelMM, defaults.restMaxTravelMM)
         burstWindow = sane(settings.burstWindow, defaults.burstWindow)
         chordTolerance = sane(settings.chordTolerance, defaults.chordTolerance)
-        reveal = settings.resting == .off
-            ? self.confirmationDelay : sane(settings.modifierReveal, defaults.modifierReveal)
-        loneModifierTapMax = sane(settings.loneModifierTapMax, defaults.loneModifierTapMax)
+        let modifierReveal = sane(settings.modifierReveal, defaults.modifierReveal)
+        if settings.resting == .off {
+            reveal = self.confirmationDelay
+        } else {
+            reveal = settings.revealHeldModifiers ? modifierReveal : nil
+        }
+        // A lone press shorter than the reveal must still tap (no silent 0.25...0.30 s gap).
+        loneModifierTapMax = max(sane(settings.loneModifierTapMax, defaults.loneModifierTapMax), modifierReveal)
         staleModifier = sane(settings.staleModifier, defaults.staleModifier)
         burstMinContacts = settings.burstMinContacts >= 2 ? settings.burstMinContacts : defaults.burstMinContacts
         burstMinRestCapable = settings.burstMinRestCapable >= 1
@@ -136,12 +162,15 @@ public struct KeyCommitPipeline {
         // presses S at its threshold); every other contact does. Space never chords this way.
         let chords = !isModifier && code != Self.space
         let othersDown = contacts.values.contains { $0.isHeld && (!chords || !$0.isChordingModifier) }
+        let resting = contacts.values.filter { $0.isHeld && $0.phase == .resting }.count
         for k in Array(contacts.values) where k.isHeld {
             if isModifier, k.chordsWhileIsolated, t <= k.landedAt + chordTolerance { continue }
             loseIsolation(of: k.id, at: t)
         }
         contacts[id] = Contact(id: id, code: code, landedAt: t, policy: kind,
-                               isolationLostAt: othersDown ? t : nil)
+                               isolationLostAt: othersDown ? t : nil,
+                               landedAmongRestingHands: resting >= staleRestingContacts,
+                               tapOnly: !isModifier && settings.tapOnlyCodes.contains(code))
         out.append(.feedback(.tentative(code)))
         if restMode { detectPlacementBurst(at: t) }
         process(to: t, into: &out)
@@ -209,7 +238,7 @@ public struct KeyCommitPipeline {
     /// Any pointer output while modifiers are held counts as their use (no stale release).
     public mutating func notePointerUse(at time: TimeInterval) {
         for id in contacts.keys where contacts[id]?.isModifier == true && contacts[id]?.isHeld == true {
-            contacts[id]?.used = true
+            contacts[id]?.pointerUsed = true
         }
     }
 
@@ -257,8 +286,8 @@ public struct KeyCommitPipeline {
             blocked = true
         }
         for m in contacts.values where m.isModifier {
-            if revealIsDue(m, at: .infinity) { consider(m.landedAt + reveal) }
-            if staleIsDue(m, at: .infinity) { consider(m.landedAt + staleModifier) }
+            if let reveal, revealIsDue(m, at: .infinity) { consider(m.landedAt + reveal) }
+            if staleIsDue(m, at: .infinity), let start = staleStart(m) { consider(start + staleModifier) }
         }
         return best
     }
@@ -268,17 +297,27 @@ public struct KeyCommitPipeline {
 
     public var postedCodes: Set<UInt16> { Set(counts.keys) }
 
-    public var hasHeldOrdinaryKey: Bool { counts.keys.contains { !Self.modifierCodes.contains($0) } }
+    /// Tap-only codes are ordinary keys here even when their code is a modifier's.
+    public var hasHeldOrdinaryKey: Bool {
+        counts.keys.contains { !Self.modifierCodes.contains($0) || settings.tapOnlyCodes.contains($0) }
+    }
 
     // MARK: - Landing
 
     private func policy(for code: UInt16, broadThumb: Bool) -> Policy {
         if code == Self.capsLock { return .immediate }
+        // A key the Mac remaps to a non-modifier (left Command -> Caps Lock): an ordinary key that
+        // never chords. Resting on it posts nothing; only a short tap types it.
+        if settings.tapOnlyCodes.contains(code) {
+            return restMode ? .onLift(max: loneModifierTapMax, travelMM: restMaxTravelMM, hold: .never) : .immediate
+        }
         if Self.modifierCodes.contains(code) { return .modifier }
         if broadThumb { return .onLift(max: Self.broadThumbMax, travelMM: Self.broadThumbTravelMM, hold: .never) }
         if settings.isRestCapable(code) {
+            // A thumb settling on Space before the hands must rest, never press and repeat.
+            let hold: Hold = code == Self.space ? .never : (settings.isolatedHold ? .isolated : .chordOnly)
             return .onLift(max: code == Self.space ? spaceRestThreshold : restThreshold,
-                           travelMM: restMaxTravelMM, hold: settings.isolatedHold ? .isolated : .chordOnly)
+                           travelMM: restMaxTravelMM, hold: hold)
         }
         return .immediate
     }
@@ -313,6 +352,16 @@ public struct KeyCommitPipeline {
         let restCapable = candidates.filter { !$0.isModifier && settings.isRestCapable($0.code) }
         guard candidates.count >= burstMinContacts, restCapable.count >= burstMinRestCapable else { return }
         let keyIDs = Set(candidates.filter { !$0.isModifier }.map(\.id))
+        // A tap-only key touched in the burst, or held since before it, is a settling thumb:
+        // lifting it (a bounce) must not tap it (left Command remapped to Caps Lock).
+        for c in contacts.values where c.tapOnly && c.isHeld && c.phase == .pending {
+            contacts[c.id]?.silentLift = true
+        }
+        // A modifier held, unused, since before the burst is a thumb that settled first.
+        for m in contacts.values where m.landedAt < start && isUnusedHeldModifier(m) && m.burst == .none {
+            contacts[m.id]?.burst = .suspect
+            contacts[m.id]?.burstPartners.formUnion(keyIDs)
+        }
         for c in candidates where c.phase == .pending {
             if c.isModifier {
                 guard c.burst != .restCandidate else { continue }
@@ -441,7 +490,7 @@ public struct KeyCommitPipeline {
         case .onLift(let max, let travel, let hold):
             if c.travelMM > travel { return .rest }
             let deadline = c.landedAt + max
-            if let lifted = c.liftedAt { return lifted < deadline ? .tap : .rest }
+            if let lifted = c.liftedAt { return lifted < deadline && !c.silentLift ? .tap : .rest }
             guard t >= deadline else { return .wait }
             let isolated = c.isolationLostAt.map { $0 >= deadline } ?? true
             guard isolated, !blocked else { return .rest }
@@ -470,6 +519,7 @@ public struct KeyCommitPipeline {
             case .rest:
                 contacts[id]?.phase = .resting
                 endFeedback(.restStarted(c.code), into: &out)
+                restUnusedModifiers(after: c, at: t, into: &out)
                 changed = true
             case .press, .tap:
                 guard !blocked else { continue }
@@ -477,7 +527,7 @@ public struct KeyCommitPipeline {
                 // A burst partner may have rested earlier in this walk (this key waited on it):
                 // that suspect modifier is decided first and does not join this key (F04).
                 if resolveSuspects(into: &out) { changed = true }
-                reconcileModifiers(for: c, into: &out)
+                reconcileModifiers(for: c, at: t, into: &out)
                 postDown(c.code, into: &out)
                 out.append(.feedback(.committed(c.code)))
                 contacts[id]?.everPosted = true
@@ -509,7 +559,7 @@ public struct KeyCommitPipeline {
 
     /// Before k goes down: exactly k's applicable modifiers are posted (I2) unless a posted
     /// one is still needed by another unresolved key (I4).
-    private mutating func reconcileModifiers(for k: Contact, into out: inout [PipelineOutput]) {
+    private mutating func reconcileModifiers(for k: Contact, at t: TimeInterval, into out: inout [PipelineOutput]) {
         let ordered = modifierIDs()
         let applicable = Set(ordered.filter { contacts[$0].map { isApplicable($0, to: k) } ?? false })
         for id in ordered.reversed() {
@@ -519,13 +569,51 @@ public struct KeyCommitPipeline {
         }
         for id in ordered where applicable.contains(id) {
             if contacts[id]?.phase == .pending { postModifier(id, byReveal: false, into: &out) }
-            contacts[id]?.used = true
+            contacts[id]?.lastChordAt = t
         }
     }
 
     private func revealIsDue(_ m: Contact, at t: TimeInterval) -> Bool {
-        m.isModifier && m.isHeld && m.phase == .pending && m.burst == .none && !m.revealDone &&
+        guard let reveal else { return false }
+        return m.isModifier && m.isHeld && m.phase == .pending && m.burst == .none && !m.revealDone &&
             t >= m.landedAt + reveal
+    }
+
+    /// Held, never posted and never used (no key committed with it, no pointer use).
+    private func isUnusedHeldModifier(_ m: Contact) -> Bool {
+        m.isModifier && m.isHeld && m.phase == .pending && !m.everPosted && !m.used
+    }
+
+    /// Key contact `key` just started resting: a modifier held unused around it is a resting
+    /// thumb or pinky (hands settling), so it rests too and never joins a later chord, unless it
+    /// still waits for a chord (`awaitsChord`). A burst suspect always rests here: this settles
+    /// it before a partner tap queued behind the resting partners commits (F04).
+    private mutating func restUnusedModifiers(after key: Contact, at t: TimeInterval,
+                                              into out: inout [PipelineOutput]) {
+        guard restMode else { return }
+        var rested = false
+        for id in modifierIDs() {
+            guard let m = contacts[id], isUnusedHeldModifier(m) else { continue }
+            if m.burst == .suspect {
+                contacts[id]?.burst = .restCandidate
+            } else if awaitsChord(m, restedKey: key) {
+                continue
+            }
+            contacts[id]?.phase = .resting
+            endFeedback(.restStarted(m.code), into: &out)
+            rested = true
+        }
+        if rested { loseIsolationOfHeldKeys(at: t) }
+    }
+
+    /// A deliberate chord may still come: a key the modifier applies to is unresolved (a shortcut
+    /// typed right after a finger or the thumb on Space came back to rest waits behind that
+    /// contact, I1), or the key that rested is one it applied to and was pressed among hands
+    /// already resting (a slow Shift+K that rested; Shift stays for the retry). Space is excluded:
+    /// thumbs settle on Cmd and Space together.
+    private func awaitsChord(_ m: Contact, restedKey k: Contact) -> Bool {
+        if isNeededByUnresolvedKey(m) { return true }
+        return k.code != Self.space && k.landedAmongRestingHands && isApplicable(m, to: k)
     }
 
     private mutating func revealModifiers(at t: TimeInterval, into out: inout [PipelineOutput]) -> Bool {
@@ -558,9 +646,25 @@ public struct KeyCommitPipeline {
         return changed
     }
 
+    /// When a held modifier's stale clock started, or nil when it never goes stale. Unused (never
+    /// posted, or posted by reveal only): from landing. Used in a chord: from its last chord or
+    /// the last ordinary key activity after it, so a thumb that settled on it and chorded once
+    /// does not keep turning every later key into a shortcut. Pointer use exempts it.
+    private func staleStart(_ m: Contact) -> TimeInterval? {
+        guard restMode, m.isModifier, m.isHeld, m.phase == .pending || m.phase == .down,
+              !m.pointerUsed else { return nil }
+        if let chord = m.lastChordAt { return max(chord, lastOrdinaryActivity ?? chord) }
+        let revealedUnused = m.phase == .down && m.postedByReveal
+        return revealedUnused || isUnusedHeldModifier(m) ? m.landedAt : nil
+    }
+
+    /// Held `staleModifier` past `staleStart` among resting hands, with no key waiting for it
+    /// and no ordinary key held down.
     private func staleIsDue(_ m: Contact, at t: TimeInterval) -> Bool {
-        guard restMode, m.isModifier, m.isHeld, m.phase == .down, m.postedByReveal, !m.used,
-              t >= m.landedAt + staleModifier else { return false }
+        guard let start = staleStart(m), t >= start + staleModifier else { return false }
+        if m.lastChordAt != nil, contacts.values.contains(where: { !$0.isModifier && $0.phase == .down }) {
+            return false
+        }
         let resting = contacts.values.filter { $0.id != m.id && $0.isHeld && $0.phase == .resting }.count
         return resting >= staleRestingContacts && !isNeededByUnresolvedKey(m)
     }
@@ -569,7 +673,8 @@ public struct KeyCommitPipeline {
         var changed = false
         for id in modifierIDs() {
             guard let m = contacts[id], staleIsDue(m, at: t) else { continue }
-            postUp(m.code, into: &out, feedback: false)
+            if m.phase == .down { postUp(m.code, into: &out, feedback: false) }
+            if m.burst == .suspect { contacts[id]?.burst = .restCandidate }
             contacts[id]?.phase = .resting
             endFeedback(.restStarted(m.code), into: &out)
             loseIsolationOfHeldKeys(at: t)

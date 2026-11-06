@@ -34,6 +34,9 @@ public struct ResolvedDeck: Equatable, Sendable {
     }
 
     /// Projected cap rects, not clipped to the screen, so edge keys stay hittable up to the screen edge.
+    /// At true scale the key field (273.98 mm) is wider than a 13-inch screen (265.19 mm Pro, 263.27 mm
+    /// Air): the screen-centred default clips about 4.4 mm (Pro) or 5.4 mm (Air) off the outer caps on
+    /// each side, and those caps keep their full 1:1 rects here.
     public init(spec: DeckSpec, projection: DeckProjection) {
         self.init(keys: spec.keys.map {
                       ResolvedKey(id: $0.id, code: $0.keyCode, rect: projection.rect($0.cap), restCapable: $0.restCapable)
@@ -47,7 +50,7 @@ public struct ResolvedDeck: Equatable, Sendable {
     /// Photo mode: the calibrated layout mapped into the photo's frame.
     public init(layout: DeckLayout, photoFrame: CGRect) {
         let restCodes: Set<UInt16> = [0, 1, 2, 3, 38, 40, 37, 41, 49]
-        let reference = MacBookAirModel.air13_2022.spec.trackpad
+        let reference = MacBookAirModel.defaultModel.spec.trackpad
         self.init(keys: layout.keys.map {
                       ResolvedKey(id: $0.id, code: $0.keyCode, rect: layout.frame(for: $0).rect(in: photoFrame),
                                   restCapable: restCodes.contains($0.keyCode))

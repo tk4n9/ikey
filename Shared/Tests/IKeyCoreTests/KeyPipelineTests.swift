@@ -166,10 +166,18 @@ final class KeyPipelineTests: XCTestCase {
         rest.lift(1, 0.2)
         XCTAssertEqual(rest.timed, ["+56@0.200", "-56@0.200"])
 
+        var slow = PipelineRun(.homeRow)
+        slow.land(1, shift, 0)
+        slow.lift(1, 0.28)
+        XCTAssertEqual(slow.timed, ["+56@0.280", "-56@0.280"],
+                       "The lone-tap limit is at least modifierReveal (no silent gap)")
+
         var long = PipelineRun(.homeRow)
         long.land(1, shift, 0)
-        long.lift(1, 0.28)
-        XCTAssertEqual(long.timed, [], "Longer than loneModifierTapMax and not yet revealed")
+        long.advance(0.31)
+        XCTAssertEqual(long.timed, [], "Never posted from time alone in rest modes")
+        long.lift(1, 0.31)
+        XCTAssertEqual(long.timed, [], "A longer lone touch is a resting pinky or thumb")
         XCTAssertEqual(long.feedback.last, .released(shift))
     }
 
@@ -333,6 +341,11 @@ final class KeyPipelineTests: XCTestCase {
         XCTAssertEqual(empty, TypingSettings())
         let roundTrip = try JSONDecoder().decode(TypingSettings.self, from: JSONEncoder().encode(expected))
         XCTAssertEqual(roundTrip, expected)
+        var extended = expected
+        extended.revealHeldModifiers = true
+        extended.tapOnlyCodes = [55]
+        let extendedTrip = try JSONDecoder().decode(TypingSettings.self, from: JSONEncoder().encode(extended))
+        XCTAssertEqual(extendedTrip, extended)
     }
 
     func testSettingsDefaultsAndKeySets() {
@@ -341,6 +354,8 @@ final class KeyPipelineTests: XCTestCase {
         XCTAssertEqual(s.restThreshold, 0.25)
         XCTAssertEqual(s.spaceRestThreshold, 0.30)
         XCTAssertTrue(s.isolatedHold)
+        XCTAssertFalse(s.revealHeldModifiers)
+        XCTAssertEqual(s.tapOnlyCodes, [])
         XCTAssertEqual(TypingSettings.homeRowCodes, [0, 1, 2, 3, 38, 40, 37, 41, 49])
         XCTAssertEqual(TypingSettings.typingKeyCodes.count, 36 + 11 + 2)
         for code: UInt16 in [36, 48, 51, 53, 57] { XCTAssertFalse(TypingSettings.typingKeyCodes.contains(code)) }
@@ -367,7 +382,9 @@ final class KeyPipelineTests: XCTestCase {
             var rng = SplitMix64(seed: UInt64(seed) &* 7919 &+ 1)
             let mode = modes[rng.below(3)]
             let confirm = rng.chance(0.2) ? 0 : 0.045
-            var p = KeyCommitPipeline(settings: TypingSettings(resting: mode), confirmationDelay: confirm)
+            let settings = TypingSettings(resting: mode, revealHeldModifiers: rng.chance(0.3),
+                                          tapOnlyCodes: rng.chance(0.3) ? [55] : [])
+            var p = KeyCommitPipeline(settings: settings, confirmationDelay: confirm)
             var time = 0.0
             var nextID = 1
             var held: [Int] = []

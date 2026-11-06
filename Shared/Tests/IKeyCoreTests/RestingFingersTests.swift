@@ -53,6 +53,9 @@ final class RestingFingersTests: XCTestCase {
     private let a: UInt16 = 0, s: UInt16 = 1, d: UInt16 = 2, f: UInt16 = 3, j: UInt16 = 38, l: UInt16 = 37
     private let e: UInt16 = 14, t: UInt16 = 17, tab: UInt16 = 48, delete: UInt16 = 51, space: UInt16 = 49
     private let caps: UInt16 = 57, shift: UInt16 = 56, cmd: UInt16 = 55, option: UInt16 = 58
+    private let h: UInt16 = 4, q: UInt16 = 12, o: UInt16 = 31
+    /// The opt-in reveal (held modifiers posted 0.30 s after landing) with its stale rule.
+    private let revealing = TypingSettings(resting: .homeRow, revealHeldModifiers: true)
 
     func testEightHomeRowPlusSpaceRest5sPostsNothing() {
         var r = RestRun()
@@ -274,22 +277,33 @@ final class RestingFingersTests: XCTestCase {
         r.land(2, s, 0.6)
         r.lift(2, 0.9)
         r.lift(1, 1.2)
-        XCTAssertEqual(r.timed, ["+55@0.300", "+1@0.850", "-1@0.900", "-55@1.200"])
+        XCTAssertEqual(r.timed, ["+55@0.850", "+1@0.850", "-1@0.900", "-55@1.200"],
+                       "Cmd is posted only with the key that commits with it")
     }
 
-    func testSlowCmdSpaceRestsButQuickCmdSpaceTypes() {
-        // Space never chords through isolation: thumbs resting on Cmd and Space must not open
-        // Spotlight. A Space tap shorter than its threshold still gives Cmd+Space.
+    func testThumbsSettlingOnCmdThenSpaceRestBoth() {
+        // Space never presses by isolation and its rest settles the unused Cmd: thumbs resting on
+        // Cmd and Space must not open Spotlight, and a later Space tap is plain.
         var r = RestRun()
         r.land(1, cmd, 0)
         r.land(2, space, 0.1)
         r.advance(0.45)
         XCTAssertEqual(r.pipeline.phase(of: 2), .resting)
+        XCTAssertEqual(r.pipeline.phase(of: 1), .resting)
         r.lift(2, 0.45)
         r.land(3, space, 0.5)
         r.lift(3, 0.6)
         r.lift(1, 0.7)
-        XCTAssertEqual(r.timed, ["+55@0.300", "+49@0.600", "-49@0.600", "-55@0.700"])
+        XCTAssertEqual(r.timed, ["+49@0.600", "-49@0.600"])
+    }
+
+    func testQuickCmdSpaceTypes() {
+        var r = RestRun()
+        r.land(1, cmd, 0)
+        r.land(2, space, 0.1)
+        r.lift(2, 0.2)
+        r.lift(1, 0.3)
+        XCTAssertEqual(r.timed, ["+55@0.200", "+49@0.200", "-49@0.200", "-55@0.300"])
     }
 
     func testThumbsRestingOnCmdAndSpaceDoNotType() {
@@ -300,17 +314,18 @@ final class RestingFingersTests: XCTestCase {
         XCTAssertEqual(r.pipeline.phase(of: 2), .resting)
         r.lift(2, 3.0)
         r.lift(1, 3.0)
-        XCTAssertEqual(r.timed, ["+55@0.300", "-55@3.000"], "lone held Cmd is revealed; Space never presses")
+        XCTAssertEqual(r.timed, [], "a resting thumb on Cmd posts nothing; Space never presses")
     }
 
     func testPinkyShiftAndThumbSpaceDoNotRepeatSpaces() {
+        // Verifier P12.
         var r = RestRun()
         r.land(1, shift, 0)
         r.land(2, space, 0.5)
         r.advance(3.0)
         r.lift(2, 3.0)
         r.lift(1, 3.0)
-        XCTAssertEqual(r.timed, ["+56@0.300", "-56@3.000"])
+        XCTAssertEqual(r.timed, [])
     }
 
     func testSlowCmdSWithIsolatedHoldOffStillChords() {
@@ -319,7 +334,7 @@ final class RestingFingersTests: XCTestCase {
         r.land(2, s, 0.6)
         r.lift(2, 0.9)
         r.lift(1, 1.2)
-        XCTAssertEqual(r.timed, ["+55@0.300", "+1@0.850", "-1@0.900", "-55@1.200"])
+        XCTAssertEqual(r.timed, ["+55@0.850", "+1@0.850", "-1@0.900", "-55@1.200"])
     }
 
     func testIsolatedHoldOffKeyRestsOnceModifierLifted() {
@@ -329,7 +344,7 @@ final class RestingFingersTests: XCTestCase {
         r.lift(1, 0.7)
         r.lift(2, 1.2)
         XCTAssertEqual(r.pipeline.phase(of: 2), nil)
-        XCTAssertEqual(r.timed, ["+55@0.300", "-55@0.850"], "Cmd up waits for S to resolve (I4)")
+        XCTAssertEqual(r.timed, [], "Cmd waits for S to resolve (I4); S rests, so nothing is typed")
     }
 
     func testQuickTapBehindBurstDoesNotPostSuspectCmd() {
@@ -369,7 +384,7 @@ final class RestingFingersTests: XCTestCase {
         r.land(2, a, 0.4)
         r.lift(2, 0.7)
         r.lift(1, 0.9)
-        XCTAssertEqual(r.timed, ["+56@0.300", "+0@0.650", "-0@0.700", "-56@0.900"])
+        XCTAssertEqual(r.timed, ["+56@0.650", "+0@0.650", "-0@0.700", "-56@0.900"])
     }
 
     func testModifierLandingAfterKeyBreaksIsolation() {
@@ -378,9 +393,10 @@ final class RestingFingersTests: XCTestCase {
         r.land(2, cmd, 0.1)
         r.advance(0.5)
         XCTAssertEqual(r.pipeline.phase(of: 1), .resting)
+        XCTAssertEqual(r.pipeline.phase(of: 2), .resting, "J rested while Cmd was held unused")
         r.lift(1, 0.8)
         r.lift(2, 1.0)
-        XCTAssertEqual(r.timed, ["+55@0.400", "-55@1.000"])
+        XCTAssertEqual(r.timed, [])
     }
 
     func testSuspectCmdLandingLastRestsAfterBounceTap() {
@@ -436,7 +452,7 @@ final class RestingFingersTests: XCTestCase {
         r.land(2, e, 5.1)
         r.lift(2, 5.2)
         r.lift(1, 6.0)
-        XCTAssertEqual(r.timed, ["+55@0.300", "+14@5.145", "-14@5.200", "-55@6.000"])
+        XCTAssertEqual(r.timed, ["+55@5.145", "+14@5.145", "-14@5.200", "-55@6.000"])
     }
 
     func testCmdHeld3sThenTabStaysDown() {
@@ -445,25 +461,47 @@ final class RestingFingersTests: XCTestCase {
         r.land(2, tab, 3.0)
         r.lift(2, 3.1)
         r.lift(1, 3.5)
+        XCTAssertEqual(r.timed, ["+55@3.045", "+48@3.045", "-48@3.100", "-55@3.500"])
+    }
+
+    func testRevealedCmdHeld3sThenTabStaysDown() {
+        var r = RestRun(revealing)
+        r.land(1, cmd, 0)
+        r.land(2, tab, 3.0)
+        r.lift(2, 3.1)
+        r.lift(1, 3.5)
         XCTAssertEqual(r.timed, ["+55@0.300", "+48@3.045", "-48@3.100", "-55@3.500"])
     }
 
-    func testOptionHeldWithPointerUseStaysDown() {
+    func testOptionFlushedForPointerStaysDownWhileHandsRest() {
         var r = RestRun()
         r.restLeftHand()
-        r.land(1, option, 0.2)
-        r.advance(1.0)
-        XCTAssertEqual(r.timed, ["+58@0.500"])
-        r.pipeline.notePointerUse(at: 1.0)
-        r.advance(3.0)
-        XCTAssertEqual(r.timed, ["+58@0.500"])
+        r.land(1, option, 1.0)
+        r.flush(1.2)
+        r.pipeline.notePointerUse(at: 1.2)
+        r.advance(4.0)
+        XCTAssertEqual(r.timed, ["+58@1.200"])
         XCTAssertEqual(r.pipeline.phase(of: 1), .down)
-        r.lift(1, 3.5)
-        XCTAssertEqual(r.timed, ["+58@0.500", "-58@3.500"])
+        r.lift(1, 4.5)
+        XCTAssertEqual(r.timed, ["+58@1.200", "-58@4.500"])
+    }
+
+    func testOptionHeldWithPointerUseStaysDown() {
+        var r = RestRun(revealing)
+        r.restLeftHand()
+        r.land(1, option, 1.0)
+        r.advance(1.5)
+        XCTAssertEqual(r.timed, ["+58@1.300"])
+        r.pipeline.notePointerUse(at: 1.5)
+        r.advance(4.0)
+        XCTAssertEqual(r.timed, ["+58@1.300"])
+        XCTAssertEqual(r.pipeline.phase(of: 1), .down)
+        r.lift(1, 4.5)
+        XCTAssertEqual(r.timed, ["+58@1.300", "-58@4.500"])
     }
 
     func testStaleCmdReleasedWhileHandsRest() {
-        var r = RestRun()
+        var r = RestRun(revealing)
         r.restLeftHand()
         r.land(1, cmd, 1.0)
         r.advance(2.9)
@@ -478,7 +516,7 @@ final class RestingFingersTests: XCTestCase {
     }
 
     func testStaleNeedsEnoughRestingContacts() {
-        var r = RestRun()
+        var r = RestRun(revealing)
         r.land(101, a, 0)
         r.land(102, s, 0.01)
         r.land(1, cmd, 1.0)
@@ -489,7 +527,7 @@ final class RestingFingersTests: XCTestCase {
     }
 
     func testStaleAppliesWhenHandsSettleLater() {
-        var r = RestRun()
+        var r = RestRun(revealing)
         r.land(1, cmd, 0)
         r.advance(2.5)
         XCTAssertEqual(r.timed, ["+55@0.300"])
@@ -546,5 +584,426 @@ final class RestingFingersTests: XCTestCase {
         r.lift(6, 5.1)
         XCTAssertEqual(r.timed, ["+14@2.100", "-14@2.100", "+51@3.045", "-51@3.100",
                                  "+36@4.045", "-36@4.100", "+57@5.045", "-57@5.100"])
+    }
+
+    // MARK: - Verifier probes (resting thumbs and pinkies never post)
+
+    /// Taps `code` at `t` for 50 ms.
+    private func tap(_ r: inout RestRun, _ id: Int, _ code: UInt16, _ t: TimeInterval) {
+        r.land(id, code, t)
+        r.lift(id, t + 0.05)
+    }
+
+    func testP14BouncingPartnerAfterSuspectCmdTypesPlain() {
+        for mod in [cmd, shift] {
+            var r = RestRun()
+            r.land(1, a, 0)
+            r.land(2, s, 0.02)
+            r.land(3, d, 0.04)
+            r.land(4, mod, 0.06)
+            r.land(5, f, 0.08)                   // last finger lands after the thumb and bounces
+            r.lift(5, 0.13)
+            r.land(6, f, 0.16)                   // and re-lands to rest
+            r.land(7, h, 1.2)
+            r.lift(7, 1.26)
+            r.advance(3.0)
+            XCTAssertEqual(r.pipeline.phase(of: 4), .resting)
+            for id in [1, 2, 3, 4, 6] { r.lift(id, 3.0) }
+            XCTAssertEqual(r.timed, ["+3@0.290", "-3@0.290", "+4@1.245", "-4@1.260"], "modifier \(mod)")
+        }
+    }
+
+    func testP6NonHomeTapInBurstAfterCmdTypesPlain() {
+        var r = RestRun()
+        r.land(1, a, 0)
+        r.land(2, s, 0.03)
+        r.land(3, d, 0.06)
+        r.land(4, cmd, 0.09)
+        r.land(5, e, 0.11)
+        r.lift(5, 0.16)
+        r.land(6, h, 1.2)
+        r.lift(6, 1.26)
+        for id in 1...4 { r.lift(id, 2.0) }
+        XCTAssertEqual(r.timed, ["+14@0.310", "-14@0.310", "+4@1.245", "-4@1.260"])
+    }
+
+    func testP6bCmdFirstThenBurstWithTapTypesPlain() {
+        var r = RestRun()
+        r.land(1, cmd, 0)
+        r.land(2, a, 0.02)
+        r.land(3, s, 0.04)
+        r.land(4, d, 0.06)
+        r.land(5, e, 0.10)
+        r.lift(5, 0.15)
+        r.land(6, h, 1.2)
+        r.lift(6, 1.26)
+        for id in 1...4 { r.lift(id, 2.0) }
+        XCTAssertEqual(r.timed, ["+14@0.310", "-14@0.310", "+4@1.245", "-4@1.260"])
+    }
+
+    func testP3LoneCmdHeld5sPostsNothing() {
+        var r = RestRun()
+        r.land(1, cmd, 0)
+        r.advance(5.0)
+        XCTAssertEqual(r.pipeline.postedCodes, [])
+        r.lift(1, 5.0)
+        XCTAssertEqual(r.timed, [])
+        XCTAssertEqual(r.feedback, [.tentative(cmd), .released(cmd)])
+    }
+
+    func testP1ThumbOnCmdBeforeHandRestsTypesPlain() {
+        var r = RestRun()
+        r.land(1, cmd, 0)
+        r.restLeftHand(at: 0.2)
+        r.advance(0.6)
+        XCTAssertEqual(r.pipeline.phase(of: 1), .resting)
+        tap(&r, 2, h, 0.8)
+        tap(&r, 3, e, 1.0)
+        XCTAssertEqual(r.timed, ["+4@0.845", "-4@0.850", "+14@1.045", "-14@1.050"])
+    }
+
+    func testP2ThumbOnCmdSettlingAfterBothHandsTypesPlain() {
+        var r = RestRun()
+        for (i, code) in [UInt16(0), 1, 2, 3, 38, 40, 37, 41].enumerated() { r.land(101 + i, code, 0) }
+        r.land(1, cmd, 0.16)
+        tap(&r, 2, q, 0.9)
+        r.advance(3.0)
+        XCTAssertEqual(r.timed, ["+12@0.945", "-12@0.950"])
+    }
+
+    func testP3bThumbsOnSpaceAndCmdWhileOtherHandTypes() {
+        var r = RestRun()
+        r.land(1, space, 0)
+        r.land(2, cmd, 0.02)
+        for (i, code) in [h, e, l, l, o].enumerated() { tap(&r, 10 + i, code, 0.6 + Double(i) * 0.15) }
+        r.advance(3.0)
+        r.lift(1, 3.0)
+        r.lift(2, 3.0)
+        XCTAssertEqual(r.keys, ["+4", "-4", "+14", "-14", "+37", "-37", "+37", "-37", "+31", "-31"])
+    }
+
+    func testP4SlowLoneCmdTapStillTaps() {
+        for duration in [0.24, 0.26, 0.28, 0.29, 0.295] {
+            var alone = RestRun()
+            alone.land(1, cmd, 0)
+            alone.lift(1, duration)
+            XCTAssertEqual(alone.keys, ["+55", "-55"], "alone, \(duration) s")
+
+            var resting = RestRun()
+            resting.restLeftHand()
+            resting.land(1, cmd, 1.0)
+            resting.lift(1, 1.0 + duration)
+            XCTAssertEqual(resting.keys, ["+55", "-55"], "hands resting, \(duration) s")
+        }
+        var long = RestRun()
+        long.land(1, cmd, 0)
+        long.lift(1, 0.35)
+        XCTAssertEqual(long.timed, [], "a longer lone touch is a resting thumb")
+    }
+
+    func testP15LoneThumbOnSpaceNeverPresses() {
+        var r = RestRun()
+        r.land(1, space, 0)
+        r.advance(3.0)
+        XCTAssertEqual(r.pipeline.phase(of: 1), .resting)
+        r.lift(1, 3.0)
+        XCTAssertEqual(r.timed, [])
+    }
+
+    func testP16ThumbOnSpaceBeforeHandsNeverPresses() {
+        var r = RestRun()
+        r.land(1, space, 0)
+        for (i, code) in [UInt16(0), 1, 2, 3, 38, 40, 37, 41].enumerated() { r.land(101 + i, code, 0.4) }
+        r.advance(3.0)
+        XCTAssertEqual(r.timed, [])
+        XCTAssertEqual(r.pipeline.postedCodes, [])
+    }
+
+    func testP8ThumbOnSpaceThenTypingDoesNotLeadWithSpace() {
+        var r = RestRun()
+        r.land(1, space, 0)
+        tap(&r, 2, h, 0.6)
+        tap(&r, 3, e, 0.75)
+        r.lift(1, 1.5)
+        XCTAssertEqual(r.timed, ["+4@0.645", "-4@0.650", "+14@0.795", "-14@0.800"])
+    }
+
+    func testThumbOnCmdLongAfterHandsRestGoesStale() {
+        var r = RestRun()
+        r.restLeftHand()
+        r.land(1, cmd, 1.0)
+        r.advance(3.0)
+        XCTAssertEqual(r.pipeline.phase(of: 1), .resting, "unused for 2 s among resting hands")
+        tap(&r, 2, e, 3.5)
+        r.lift(1, 4.0)
+        XCTAssertEqual(r.timed, ["+14@3.545", "-14@3.550"])
+    }
+
+    func testDeliberateCmdEWhileHandsRestChords() {
+        var r = RestRun()
+        r.restLeftHand()
+        r.land(1, cmd, 1.0)
+        tap(&r, 2, e, 1.3)
+        r.lift(1, 1.5)
+        XCTAssertEqual(r.timed, ["+55@1.345", "+14@1.345", "-14@1.350", "-55@1.500"])
+    }
+
+    func testDeliberateCmdCFromRestingHandChords() {
+        // Touch typist: hands rest, the thumb presses Cmd, the middle finger leaves D for C.
+        var r = RestRun()
+        r.restLeftHand()
+        r.land(1, cmd, 1.0)
+        r.lift(103, 1.1)
+        r.land(2, 8, 1.15)
+        r.lift(2, 1.22)
+        r.land(3, d, 1.3)                        // the finger returns to D and rests
+        r.lift(1, 1.4)
+        r.advance(2.0)
+        XCTAssertEqual(r.timed, ["+55@1.195", "+8@1.195", "-8@1.220", "-55@1.550"],
+                       "Cmd up waits until D, landed while Cmd was held, rests (I4)")
+    }
+
+    func testFastCapitalRolloverInBurstStillShifts() {
+        // A held Shift turns suspect in a burst-shaped rollover but every partner taps, so
+        // nothing rests and Shift applies (resolution a).
+        var r = RestRun()
+        r.land(1, shift, 0)
+        r.land(2, a, 0.4)
+        r.land(3, s, 0.43)
+        r.land(4, d, 0.46)
+        r.lift(2, 0.5)
+        r.lift(3, 0.52)
+        r.lift(4, 0.55)
+        r.lift(1, 0.7)
+        XCTAssertEqual(r.keys, ["+56", "+0", "-0", "+1", "-1", "+2", "-2", "-56"])
+    }
+
+    // MARK: - Tap-only codes (left Command remapped to Caps Lock on the Mac)
+
+    private let tapOnlyCmd = TypingSettings(resting: .homeRow, tapOnlyCodes: [55])
+
+    func testTapOnlyCmdTapPostsDownUpAtLift() {
+        var r = RestRun(tapOnlyCmd)
+        r.land(1, cmd, 0)
+        r.lift(1, 0.12)
+        XCTAssertEqual(r.timed, ["+55@0.120", "-55@0.120"])
+        var resting = RestRun(tapOnlyCmd)
+        resting.restLeftHand()
+        resting.land(1, cmd, 1.0)
+        resting.lift(1, 1.28)
+        XCTAssertEqual(resting.timed, ["+55@1.280", "-55@1.280"])
+    }
+
+    func testTapOnlyCmdRestingNeverChordsOrPosts() {
+        var r = RestRun(tapOnlyCmd)
+        r.land(1, cmd, 0)
+        r.advance(1.0)
+        XCTAssertEqual(r.pipeline.phase(of: 1), .resting)
+        tap(&r, 2, h, 1.0)
+        r.flush(1.2)
+        tap(&r, 3, s, 1.4)
+        r.lift(1, 3.0)
+        XCTAssertEqual(r.timed, ["+4@1.045", "-4@1.050", "+1@1.450", "-1@1.450"])
+    }
+
+    func testTapOnlyCmdDoesNotChordWithQuickKey() {
+        var r = RestRun(tapOnlyCmd)
+        r.land(1, cmd, 0)
+        r.land(2, h, 0.05)
+        r.lift(2, 0.1)
+        r.lift(1, 0.15)
+        XCTAssertEqual(r.timed, ["+55@0.150", "-55@0.150", "+4@0.150", "-4@0.150"],
+                       "a quick tap is a Caps Lock press of its own, in landing order")
+    }
+
+    func testTapOnlyCmdWithRestingOffIsAPlainKey() {
+        var r = RestRun(TypingSettings(resting: .off, tapOnlyCodes: [55]))
+        r.land(1, cmd, 0)
+        r.land(2, h, 0.2)
+        r.lift(2, 0.3)
+        XCTAssertTrue(r.pipeline.hasHeldOrdinaryKey, "a tap-only code is an ordinary key")
+        r.lift(1, 0.8)
+        XCTAssertEqual(r.timed, ["+55@0.045", "+4@0.245", "-4@0.300", "-55@0.800"])
+    }
+
+    // MARK: - Settling contacts do not swallow a queued chord (verifier R1-R4, S1)
+
+    private let c: UInt16 = 8, k: UInt16 = 40, rightCmd: UInt16 = 54, rightShift: UInt16 = 60
+
+    func testR1FastCapitalAfterSettlingFingerStaysShifted() {
+        var r = RestRun()
+        r.restLeftHand()
+        r.land(1, j, 1.0)                        // right index comes back to rest
+        r.land(2, shift, 1.08)
+        r.land(3, t, 1.12)
+        r.lift(3, 1.20)
+        r.lift(2, 1.3)
+        r.advance(2.0)
+        XCTAssertEqual(r.timed, ["+56@1.250", "+17@1.250", "-17@1.250", "-56@1.300"],
+                       "T waits behind J (I1); J resting must not rest the Shift T was typed with")
+    }
+
+    func testR1bCmdCAfterSettlingFingerChords() {
+        var r = RestRun()
+        r.restLeftHand()
+        r.land(1, j, 1.0)
+        r.land(2, rightCmd, 1.05)
+        r.land(3, c, 1.10)
+        r.lift(3, 1.17)
+        r.lift(2, 1.3)
+        XCTAssertEqual(r.timed, ["+54@1.250", "+8@1.250", "-8@1.250", "-54@1.300"])
+    }
+
+    func testR3CmdCAfterThumbSettlesOnSpaceChords() {
+        var r = RestRun()
+        r.restLeftHand()
+        r.land(1, space, 1.0)
+        r.land(2, cmd, 1.1)
+        r.land(3, c, 1.15)
+        r.lift(3, 1.21)
+        r.lift(2, 1.4)
+        r.lift(1, 2.0)
+        XCTAssertEqual(r.timed, ["+55@1.300", "+8@1.300", "-8@1.300", "-55@1.400"])
+
+        var control = RestRun()                  // R3c: no settling contact
+        control.restLeftHand()
+        control.land(2, cmd, 1.1)
+        control.land(3, c, 1.15)
+        control.lift(3, 1.21)
+        control.lift(2, 1.4)
+        XCTAssertEqual(control.timed, ["+55@1.195", "+8@1.195", "-8@1.210", "-55@1.400"])
+    }
+
+    func testR2CapitalAfterThumbSettlesOnSpaceStaysShifted() {
+        var r = RestRun()
+        r.restLeftHand()
+        r.land(1, space, 1.0)
+        r.land(2, rightShift, 1.1)
+        r.lift(104, 1.12)                        // the index leaves its resting F
+        r.land(3, f, 1.15)
+        r.lift(3, 1.32)
+        r.lift(2, 1.4)
+        r.lift(1, 2.0)
+        XCTAssertEqual(r.timed, ["+60@1.320", "+3@1.320", "-3@1.320", "-60@1.400"])
+    }
+
+    func testR4CapitalAfterTwoSettlingFingersStaysShifted() {
+        var r = RestRun()
+        r.restLeftHand()
+        r.land(1, k, 1.0)
+        r.land(2, l, 1.02)
+        r.land(3, rightShift, 1.10)
+        r.land(4, j, 1.14)
+        r.lift(4, 1.22)
+        r.lift(3, 1.35)
+        XCTAssertEqual(r.timed, ["+60@1.270", "+38@1.270", "-38@1.270", "-60@1.350"])
+    }
+
+    func testS1SlowShiftKThatRestedKeepsShiftForTheRetry() {
+        var r = RestRun()
+        r.restLeftHand()
+        for (i, code) in [j, l, UInt16(41), k].enumerated() { r.land(105 + i, code, 0.04 + Double(i) * 0.01) }
+        r.lift(108, 1.9)                         // the middle finger leaves K
+        r.land(1, rightShift, 2.0)
+        r.land(2, k, 2.05)                       // pressed too slowly among resting hands: rests
+        r.lift(2, 2.40)
+        XCTAssertEqual(r.pipeline.phase(of: 1), .pending, "Shift still waits for its chord")
+        r.land(3, k, 2.5)
+        r.lift(3, 2.55)
+        r.lift(1, 2.7)
+        XCTAssertEqual(r.timed, ["+60@2.550", "+40@2.550", "-40@2.550", "-60@2.700"])
+    }
+
+    func testSlowSpaceUnderHeldCmdStillRestsCmd() {
+        // Space is excluded from the S1 rule: thumbs settle on Cmd and Space together.
+        var r = RestRun()
+        r.restLeftHand()
+        r.land(1, cmd, 1.0)
+        r.land(2, space, 1.01)
+        r.advance(1.4)
+        XCTAssertEqual(r.pipeline.phase(of: 1), .resting)
+        tap(&r, 3, h, 1.5)
+        XCTAssertEqual(r.timed, ["+4@1.545", "-4@1.550"])
+    }
+
+    // MARK: - Tap-only bounce during hand placement (verifier TB1, TB1b, TB3)
+
+    func testTB1TapOnlyThumbBouncingInBurstPostsNothing() {
+        var r = RestRun(tapOnlyCmd)
+        r.restLeftHand()
+        r.land(1, cmd, 0.05)
+        r.lift(1, 0.11)
+        r.land(2, cmd, 0.16)                     // re-lands and rests
+        r.advance(1.0)
+        XCTAssertEqual(r.timed, [])
+        r.lift(2, 1.5)
+        r.land(3, cmd, 2.0)                      // a later deliberate tap still types
+        r.lift(3, 2.1)
+        XCTAssertEqual(r.timed, ["+55@2.100", "-55@2.100"])
+    }
+
+    func testTB1bTapOnlyThumbHeldBeforeBurstBouncesSilently() {
+        var r = RestRun(tapOnlyCmd)
+        r.land(1, cmd, 0)
+        r.restLeftHand(at: 0.03)
+        r.lift(1, 0.12)
+        r.land(2, cmd, 0.18)
+        r.advance(1.0)
+        r.lift(2, 1.0)
+        XCTAssertEqual(r.timed, [])
+    }
+
+    func testTB3TapOnlyTapOverlappingHandPlacementIsDropped() {
+        // Ambiguous on purpose: a tap-only press that overlaps a placement burst is treated as a
+        // settling thumb, so a stray input-source switch is never posted.
+        var r = RestRun(tapOnlyCmd)
+        r.land(1, cmd, 0)
+        r.restLeftHand(at: 0.05)
+        r.lift(1, 0.15)
+        r.advance(1.0)
+        XCTAssertEqual(r.timed, [])
+    }
+
+    // MARK: - Stale rule after use (verifier PV4)
+
+    func testPV4ModifierSettledAmongRestingHandsStopsChordingAfterStale() {
+        for mod: UInt16 in [cmd, shift, option, 59, rightCmd] {
+            var r = RestRun()
+            r.restLeftHand()
+            r.land(1, mod, 0.5)
+            tap(&r, 2, h, 1.2)                   // still chords: the accepted ambiguity
+            tap(&r, 3, q, 4.2)
+            r.advance(6.0)
+            XCTAssertEqual(r.pipeline.phase(of: 1), .resting, "modifier \(mod)")
+            r.lift(1, 6.0)
+            XCTAssertEqual(r.timed, ["+\(mod)@1.245", "+4@1.245", "-4@1.250", "-\(mod)@3.250",
+                                     "+12@4.245", "-12@4.250"], "modifier \(mod)")
+        }
+    }
+
+    func testUsedModifierStaleCountsFromLastKeyActivity() {
+        var r = RestRun()
+        r.restLeftHand()
+        r.land(1, cmd, 0.5)
+        tap(&r, 2, h, 1.0)
+        tap(&r, 3, q, 2.5)                       // within 2 s of the last chord: still chords
+        r.land(4, delete, 3.0)                   // held down: never stale while it is held
+        r.advance(6.0)
+        XCTAssertEqual(r.pipeline.phase(of: 1), .down)
+        r.lift(4, 6.0)
+        r.advance(7.9)
+        XCTAssertEqual(r.pipeline.phase(of: 1), .down)
+        r.advance(8.0)
+        XCTAssertEqual(r.timed, ["+55@1.045", "+4@1.045", "-4@1.050", "+12@2.545", "-12@2.550",
+                                 "+51@3.045", "-51@6.000", "-55@8.000"])
+    }
+
+    func testUsedModifierWithoutRestingHandsStaysDown() {
+        var r = RestRun()
+        r.land(1, cmd, 0)
+        tap(&r, 2, 48, 0.2)                      // Cmd-Tab, then a long look at the switcher
+        r.advance(5.0)
+        r.lift(1, 5.0)
+        XCTAssertEqual(r.timed, ["+55@0.245", "+48@0.245", "-48@0.250", "-55@5.000"])
     }
 }

@@ -6,8 +6,9 @@ import XCTest
 @testable import IKeyCore
 
 final class KeyHitTesterTests: XCTestCase {
-    private let spec = MacBookAirModel.air13_2022.spec
-    private let projection = DeckProjection(display: .pro13, screenSize: CGSize(width: 1376, height: 1032))
+    private let spec = MacBookAirModel.defaultModel.spec
+    /// Screen-centred default placement on the iPad Pro 13.
+    private lazy var projection = DeckProjection(display: .pro13, spec: spec, screenSize: CGSize(width: 1376, height: 1032))
     private lazy var deck = ResolvedDeck(spec: spec, projection: projection)
     private lazy var tester = KeyHitTester(deck: deck, captureRadius: KeyHitTester.defaultCaptureRadius(for: deck))
 
@@ -124,19 +125,38 @@ final class KeyHitTesterTests: XCTestCase {
         XCTAssertEqual(tester.hit(CGPoint(x: deck.trackpad.midX, y: deck.trackpad.midY)), .trackpad)
     }
 
+    /// The key field is wider than both 13-inch screens; the screen-centred default clips the outer caps
+    /// symmetrically and they stay hittable right up to each screen edge.
     func testNegativeOriginEdgeKeysHit() throws {
-        for (id, code) in [("esc", UInt16(53)), ("tab", 48), ("capslock", 57), ("shift_l", 56), ("fn", 63)] {
-            let r = try resolved(id).rect
-            XCTAssertLessThan(r.minX, 0, id)
-            for x in [0.0, 1.0, 2.0] {
-                XCTAssertEqual(tester.hit(CGPoint(x: x, y: Double(r.midY))), .key(code: code, distance: 0), id)
+        for (display, size) in [(IPadDisplaySpec.pro13, CGSize(width: 1376, height: 1032)),
+                                (.air13, CGSize(width: 1366, height: 1024))] {
+            let p = DeckProjection(display: display, spec: spec, screenSize: size)
+            let deck = ResolvedDeck(spec: spec, projection: p)
+            let tester = KeyHitTester(deck: deck, captureRadius: KeyHitTester.defaultCaptureRadius(for: deck))
+            func rect(_ id: String) throws -> CGRect { try XCTUnwrap(deck.keys.first { $0.id == id }, id).rect }
+            for (id, code) in [("esc", UInt16(53)), ("tab", 48), ("capslock", 57), ("shift_l", 56), ("fn", 63)] {
+                let r = try rect(id)
+                XCTAssertLessThan(r.minX, 0, id)
+                for x in [0.0, 1.0, 2.0] {
+                    XCTAssertEqual(tester.hit(CGPoint(x: x, y: Double(r.midY))), .key(code: code, distance: 0), "\(display.id) \(id)")
+                }
             }
-        }
-        // Right edge too.
-        for id in ["delete", "backslash", "return", "shift_r", "right"] {
-            let key = try resolved(id)
-            XCTAssertGreaterThan(key.rect.maxX, 1376, id)
-            XCTAssertEqual(code(tester.hit(CGPoint(x: 1375, y: key.rect.midY))), key.code, id)
+            // Right edge too.
+            for id in ["delete", "backslash", "return", "shift_r", "right", "touchid"] {
+                let key = try XCTUnwrap(deck.keys.first { $0.id == id })
+                XCTAssertGreaterThan(key.rect.maxX, size.width, id)
+                let hit = tester.hit(CGPoint(x: size.width - 1, y: key.rect.midY))
+                if let c = key.code {
+                    XCTAssertEqual(hit, .key(code: c, distance: 0), "\(display.id) \(id)")
+                } else {
+                    XCTAssertEqual(hit, .inert(id: id), display.id)
+                }
+            }
+            // Symmetric clip: the same width is cut off each side.
+            XCTAssertEqual(Double(-(try rect("esc")).minX), Double((try rect("delete")).maxX - size.width), accuracy: 1e-9)
+            // The whole function row and trackpad are on screen.
+            XCTAssertGreaterThan(try rect("f5").minY, 0)
+            XCTAssertLessThan(deck.trackpad.maxY, size.height)
         }
     }
 

@@ -3,8 +3,9 @@ import XCTest
 @testable import IKeyCore
 
 // Values here are regression locks on the deck constants, not evidence of physical fidelity.
+// The fixture is the default preset (M4/M5, `air13_2025`); the 2022 preset shares its geometry.
 final class DeckSpecTests: XCTestCase {
-    private let spec = MacBookAirModel.air13_2022.spec
+    private let spec = MacBookAirModel.defaultModel.spec
     /// KL x of a D x for the 2022/2025 decks.
     private func klX(_ x: Double) -> Double { x + 136.99 }
 
@@ -25,7 +26,8 @@ final class DeckSpecTests: XCTestCase {
         XCTAssertEqual(spec.key(code: 0)?.id, "a")
         XCTAssertEqual(spec.key(code: 126)?.id, "up")
         XCTAssertNil(spec.key(code: 10))
-        XCTAssertEqual(MacBookAirModel.air13_2025.spec.keys, spec.keys)
+        XCTAssertEqual(MacBookAirModel.air13_2022.spec.keys, spec.keys)
+        XCTAssertEqual(spec.model, .air13_2025)
     }
 
     func testRowRightEdgesAndSpans() throws {
@@ -83,6 +85,19 @@ final class DeckSpecTests: XCTestCase {
         XCTAssertEqual(spec.well.midX, 0, accuracy: 1e-9)
         XCTAssertEqual(spec.chassis.width, 304.1, accuracy: 1e-9)
         XCTAssertEqual(spec.keyField.height, 109.45, accuracy: 0.001)
+    }
+
+    func testDefaultModelAndFunctionRowTop() {
+        XCTAssertEqual(MacBookAirModel.defaultModel, .air13_2025)
+        XCTAssertEqual(MacBookAirModel.air13_2025.spec.functionRowTopY, 199.87, accuracy: 1e-9)
+        XCTAssertEqual(MacBookAirModel.air13_2022.spec.functionRowTopY, 199.87, accuracy: 1e-9)
+        XCTAssertEqual(MacBookAirModel.air13_2020.spec.functionRowTopY, 193.04, accuracy: 1e-9)
+        // Span centred on screen by the default placement: function row top to trackpad bottom.
+        XCTAssertEqual(spec.functionRowTopY - spec.trackpad.minY, 194.79, accuracy: 1e-9)
+        XCTAssertEqual(MacBookAirModel.air13_2020.spec.functionRowTopY - MacBookAirModel.air13_2020.spec.trackpad.minY,
+                       187.04, accuracy: 1e-9)
+        // It fits the shorter (Air) 13-inch screen: 1024 pt / (1366 / 263.27 pt per mm) = 197.36 mm.
+        XCTAssertLessThan(spec.functionRowTopY - spec.trackpad.minY, 1024 / (1366 / 263.27))
     }
 
     func testM1Variant() throws {
