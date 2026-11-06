@@ -1,27 +1,55 @@
 import AppKit
+import Carbon
 import CoreGraphics
 import Foundation
 import IKeyCore
+import IOKit
+import IOKit.pwr_mgt
+import os
 
 /// Posts only events received from the authenticated iPad. Never monitors local typing.
 ///
-/// The public members are a frozen API: ReceiverModel and the menu are written against it.
-/// Today protocol v1 frames run through the legacy path below; v2 messages and the stored
-/// settings take effect once the InjectorCore-based body lands. Main-queue confined.
+/// Protocol v1 frames run through `LegacyEventInjector` unchanged. Protocol v2 messages go
+/// through the Linux-tested `InjectorCore`; this class only reads the Mac's environment, turns
+/// the core's `SynthEvent`s into CGEvents (and the few system calls the core asks for) and
+/// drives the core's deadlines with a one-shot timer. Main-queue confined.
 final class EventInjector {
     /// Called when `hasHeldInput` changes.
     var onHeldInputChanged: ((Bool) -> Void)?
 
-    /// True while any key or mouse button is held down on the Mac.
-    var hasHeldInput: Bool { !heldKeys.isEmpty || leftDown || rightDown }
+    /// True while any key, mouse button or scroll gesture is held on the Mac (v1 or v2).
+    var hasHeldInput: Bool { core.hasHeldInput || legacy.hasHeldInput }
 
-    /// The system Caps Lock state, falling back to the HID event flags.
+    /// The Caps Lock state iKey types with: the virtual lock after a fallback to virtual mode,
+    /// otherwise the system state (falling back to the HID event flags).
     var capsLockOn: Bool {
-        CapsLockHardware.read() ?? CGEventSource.flagsState(.hidSystemState).contains(.maskAlphaShift)
+        effectiveCapsMode == .virtual ? virtualCapsOn : Self.systemCapsLockOn
     }
 
-    /// The Caps Lock behaviour in effect; the legacy path toggles a virtual lock.
-    var effectiveCapsMode: CapsMode { .virtual }
+    /// The Caps Lock behaviour in effect (`.virtual` after a failed hardware set in `.system`
+    /// mode; `.switchesInputSource` is kept, see `setCapsLock`).
+    var effectiveCapsMode: CapsMode { settings.capsMode }
+
+    /// Additive (amendments C/H): the Mac's own key remapping that v2 input mirrors, read from
+    /// hidutil, the Modifier Keys preferences and Karabiner-Elements. Empty until the first read.
+    private(set) var keyRemap = KeyRemap()
+    /// Additive: called on the main queue when `keyRemap` changes (e.g. to send MacState.tapOnly).
+    var onKeyRemapChanged: ((KeyRemap) -> Void)?
+
+    /// Every posted event carries this in kCGEventSourceUserData ("iKey").
+    private static let userData: Int64 = 0x694B6579
+    /// The remap is re-read this often (a repeating timer, independent of input) and at most
+    /// this often on v2 input.
+    private static let remapRefreshInterval: TimeInterval = 2.0
+    private static let log = Logger(subsystem: "com.ikey.mac", category: "injector")
+
+    private let legacy = LegacyEventInjector()
+    private var core = InjectorCore()
+    private var settings = InjectorSettings()
+    private let source = CGEventSource(stateID: .privateState)
+    private let inputSources = InputSourceHistory()
+    private var timer: DispatchSourceTimer?
+    private var reportedHeldInput = false
 
     private var readings: MacReadings?
     private var gainScale = 1.0
@@ -31,107 +59,182 @@ final class EventInjector {
     private var capsModePreference: CapsMode?
     /// nil: follow the Mac's settings.
     private var fnTapPreference: FnTapAction?
-    private var reportedHeldInput = false
+    /// Set when the system Caps Lock could not be set and verified in `.system` mode; forces
+    /// `.virtual` (while the chosen mode is `.system`) until the user picks another Caps Lock
+    /// preference.
+    private var capsHardwareFailed = false
+    /// The core's virtual lock, mirrored from the Caps Lock flagsChanged events it emits.
+    private var virtualCapsOn = false
 
-    private let source = CGEventSource(stateID: .privateState)
-    private var heldKeys: Set<UInt16> = []
-    private var capsLockEnabled = false
-    private var leftDown = false
-    private var rightDown = false
-    private var scrollRemainder = CGPoint.zero
-    private var clicks: [String: Click] = [:]
+    private var userActivityAssertion = IOPMAssertionID(0)
+    private var remapReadInFlight = false
+    private var lastRemapRead: TimeInterval = -.infinity
+    /// The last successfully read pairs of each remap layer; a layer whose read fails keeps
+    /// these, so one failed or slow read never drops the user's remap.
+    private var remapLayers = KeyRemapReader.Layers()
+    private var remapTimer: DispatchSourceTimer?
+    /// The layers whose last read failed (logged only when this changes).
+    private var lastRemapFailures: [String] = []
 
-    private struct Click {
-        var time: TimeInterval
-        var location: CGPoint
-        var count: Int64
+    init() {
+        refreshKeyRemap(at: Self.now)
+        startRemapTimer()
     }
 
-    private let modifierFlags: [UInt16: CGEventFlags] = [
-        54: .maskCommand, 55: .maskCommand,
-        56: .maskShift, 60: .maskShift,
-        58: .maskAlternate, 61: .maskAlternate,
-        59: .maskControl, 62: .maskControl,
-        63: .maskSecondaryFn
-    ]
+    deinit {
+        timer?.cancel()
+        remapTimer?.cancel()
+        if userActivityAssertion != 0 { IOPMAssertionRelease(userActivityAssertion) }
+    }
 
-    private var flags: CGEventFlags {
-        heldKeys.reduce(into: capsLockEnabled ? CGEventFlags.maskAlphaShift : CGEventFlags()) { result, code in
-            if let flag = modifierFlags[code] { result.formUnion(flag) }
-        }
+    // MARK: - Frozen API
+
+    /// Protocol v1 input.
+    func handle(_ event: InputEvent) {
+        legacy.handle(event)
+        reportHeldInput()
     }
 
     func handle(_ message: PadMessage) {
-        if case .legacy(let event) = message { handle(event) }
+        if case .legacy(let event) = message {
+            handle(event)
+            return
+        }
+        let now = Self.now
+        if case .input = message, now - lastRemapRead >= Self.remapRefreshInterval { refreshKeyRemap(at: now) }
+        post(core.handle(message, at: now, env: environment()))
+        didCallCore()
+    }
+
+    func releaseAll() {
+        post(core.releaseAll(at: Self.now, env: environment()))
+        legacy.releaseAll()
+        didCallCore()
     }
 
     func apply(readings: MacReadings) {
         self.readings = readings
+        rebuildSettings()
+        refreshKeyRemap(at: Self.now)
     }
 
     func setTuning(gainScale: Double, scrollSpeedFactor: Double) {
         self.gainScale = gainScale
         self.scrollSpeedFactor = scrollSpeedFactor
+        rebuildSettings()
     }
 
     func setTopRowChoices(_ choices: [TopRowFunction: TopRowStrategy]) {
         topRowChoices = choices
+        rebuildSettings()
     }
 
-    /// nil = automatic from the readings.
+    /// nil = automatic from the readings. A new preference retries the hardware lock after a
+    /// fallback to virtual mode.
     func setCapsModePreference(_ mode: CapsMode?) {
+        if mode != capsModePreference { capsHardwareFailed = false }
         capsModePreference = mode
+        rebuildSettings()
     }
 
     /// nil = automatic from the readings.
     func setFnTapPreference(_ action: FnTapAction?) {
         fnTapPreference = action
+        rebuildSettings()
     }
 
-    /// Posts one top-row function with the given strategy (the menu's self-test). The legacy
-    /// path has no top-row strategies, so this posts nothing until the v2 body lands.
-    func postTopRowTest(_ f: TopRowFunction, strategy: TopRowStrategy) {}
-
-    func handle(_ event: InputEvent) {
-        defer { reportHeldInput() }
-        // Keep the input sink defensive even if called outside the wire decoder.
-        guard (try? event.validate()) != nil else { return }
-        switch event {
-        case .key(let code, let down):
-            postKey(code: code, down: down)
-        case .pointer(let dx, let dy):
-            move(dx: dx, dy: dy)
-        case .button(let button, let down):
-            postButton(button, down: down)
-        case .scroll(let dx, let dy):
-            scroll(dx: dx, dy: dy)
-        case .releaseAll:
-            releaseAll()
-        case .heartbeat:
-            break
-        }
+    /// Posts one top-row function with the given strategy as a down then an up (the menu's
+    /// self-test), on top of the modifiers the iPad currently holds.
+    func postTopRowTest(_ f: TopRowFunction, strategy: TopRowStrategy) {
+        post(core.testTopRow(f, strategy: strategy, env: environment()))
+        didCallCore()
     }
 
-    func releaseAll() {
-        // Release regular keys while their modifiers are still held, then modifiers.
-        let codes = heldKeys.sorted {
-            let lhsModifier = modifierFlags[$0] != nil
-            let rhsModifier = modifierFlags[$1] != nil
-            return lhsModifier == rhsModifier ? $0 < $1 : !lhsModifier
+    // MARK: - Settings
+
+    private func rebuildSettings() {
+        var s = InjectorSettings()
+        if let r = readings {
+            s.prefs = r.prefs
+            s.hotKeys = r.hotKeys
+            s.pointerCurves = r.liveCurves.pointer
+            s.scrollCurves = r.liveCurves.scroll
+            s.trackingIndexOverride = r.liveCurves.trackingIndex
+            s.scrollBasePtPerMM = r.builtInPtPerMM ?? 5.0
         }
-        for code in codes { postKey(code: code, down: false) }
-        if leftDown { postButton(.left, down: false) }
-        if rightDown { postButton(.right, down: false) }
-        if capsLockEnabled {
-            capsLockEnabled = false
-            postModifierFlags(code: 57)
-        }
-        heldKeys.removeAll()
-        leftDown = false
-        rightDown = false
-        scrollRemainder = .zero
-        clicks.removeAll()
+        s.gainScale = gainScale
+        s.scrollSpeedFactor = scrollSpeedFactor
+        s.topRowChoices = topRowChoices
+        let multipleSources = (readings?.enabledInputSourceCount ?? 0) > 1
+        let automaticCaps: CapsMode = readings?.capsSwitchesInputSource == true && multipleSources
+            ? .switchesInputSource : .system
+        let chosenCaps = capsModePreference ?? automaticCaps
+        // Only the plain system lock falls back to virtual; input-source switching (the user's
+        // remapped left Command) must keep working when the hardware lock cannot be set.
+        s.capsMode = capsHardwareFailed && chosenCaps == .system ? .virtual : chosenCaps
+        let automaticFnTap: FnTapAction = multipleSources ? .changeInputSource : FnTapAction.none
+        s.fnTapAction = fnTapPreference ?? readings?.fnTapAction ?? automaticFnTap
+        s.keyRemap = keyRemap.map
+        guard s != settings else { return }
+        // A mode change resets the core's Caps Lock controller, including its virtual lock.
+        if s.capsMode != settings.capsMode { virtualCapsOn = false }
+        settings = s
+        core.update(settings: s)
+        didCallCore()
+    }
+
+    // MARK: - Environment and deadlines
+
+    private static var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    private static var systemCapsLockOn: Bool {
+        CapsLockHardware.read() ?? CGEventSource.flagsState(.hidSystemState).contains(.maskAlphaShift)
+    }
+
+    private func environment() -> PointerEnvironment {
+        PointerEnvironment(cursor: CGEvent(source: nil)?.location ?? .zero,
+                           displays: Self.activeDisplayBounds(),
+                           capsLockOn: Self.systemCapsLockOn)
+    }
+
+    /// Global display bounds (Quartz coordinates, y down; negative origins allowed).
+    private static func activeDisplayBounds() -> [CGRect] {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetActiveDisplayList(count, &displays, &count) == .success else { return [] }
+        return displays.prefix(Int(count)).map { CGDisplayBounds($0) }
+    }
+
+    private func didCallCore() {
+        scheduleTick()
         reportHeldInput()
+    }
+
+    /// Re-arms the one-shot timer at the core's next deadline (repeat, Caps Lock hold,
+    /// momentum frame), or parks it when there is none.
+    private func scheduleTick() {
+        let timer = self.timer ?? makeTimer()
+        guard let deadline = core.nextDeadline, deadline.isFinite else {
+            timer.schedule(deadline: .distantFuture, repeating: .never, leeway: .milliseconds(1))
+            return
+        }
+        let delay = min(max(deadline - Self.now, 0), 3600)
+        timer.schedule(deadline: .now() + delay, repeating: .never, leeway: .milliseconds(1))
+    }
+
+    private func makeTimer() -> DispatchSourceTimer {
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.setEventHandler { [weak self] in self?.tick() }
+        timer.schedule(deadline: .distantFuture, repeating: .never, leeway: .milliseconds(1))
+        timer.resume()
+        self.timer = timer
+        return timer
+    }
+
+    private func tick() {
+        post(core.tick(at: Self.now, env: environment()))
+        didCallCore()
     }
 
     private func reportHeldInput() {
@@ -141,94 +244,400 @@ final class EventInjector {
         onHeldInputChanged?(held)
     }
 
-    private func postKey(code: UInt16, down: Bool) {
-        let wasHeld = heldKeys.contains(code)
-        guard down || wasHeld else { return }
-        let isModifier = modifierFlags[code] != nil || code == 57
-        if down && wasHeld && isModifier { return }
-        if down { heldKeys.insert(code) } else { heldKeys.remove(code) }
-        // Caps Lock is a virtual toggle for this session; never change keyboard LEDs.
-        if code == 57 && down { capsLockEnabled.toggle() }
-        guard let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(code), keyDown: down) else { return }
-        event.flags = flags
-        if isModifier { event.type = .flagsChanged }
-        event.setIntegerValueField(.keyboardEventAutorepeat, value: down && wasHeld ? 1 : 0)
+    // MARK: - Posting
+
+    private func post(_ events: [SynthEvent]) {
+        for synth in events { post(synth) }
+    }
+
+    private func post(_ synth: SynthEvent) {
+        switch synth {
+        case let .key(code, down, flags, autorepeat):
+            postKey(code, down: down, flags: flags, autorepeat: autorepeat, flagsChanged: false)
+
+        case let .flagsChanged(code, flags):
+            if code == MacKeyCode.capsLock { virtualCapsOn = flags.contains(.alphaShift) }
+            postKey(code, down: false, flags: flags, autorepeat: false, flagsChanged: true)
+
+        case let .aux(nxKeyType, down, autorepeat, flags):
+            postAux(nxKeyType, down: down, autorepeat: autorepeat, flags: flags)
+
+        case let .openApplication(path):
+            NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: path),
+                                               configuration: NSWorkspace.OpenConfiguration(),
+                                               completionHandler: nil)
+
+        case let .setCapsLock(on):
+            setCapsLock(on)
+
+        case let .mouseMove(to, deltaX, deltaY, drag, flags):
+            let type: CGEventType
+            switch drag {
+            case .left: type = .leftMouseDragged
+            case .right: type = .rightMouseDragged
+            case nil: type = .mouseMoved
+            }
+            let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: to,
+                                mouseButton: drag == .right ? .right : .left)
+            event?.flags = CGEventFlags(rawValue: flags.rawValue)
+            event?.setIntegerValueField(.mouseEventDeltaX, value: deltaX)
+            event?.setIntegerValueField(.mouseEventDeltaY, value: deltaY)
+            post(event)
+
+        case let .mouseButton(button, down, at, clickState, flags):
+            let type: CGEventType
+            switch button {
+            case .left: type = down ? .leftMouseDown : .leftMouseUp
+            case .right: type = down ? .rightMouseDown : .rightMouseUp
+            }
+            let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: at,
+                                mouseButton: button == .right ? .right : .left)
+            event?.flags = CGEventFlags(rawValue: flags.rawValue)
+            event?.setIntegerValueField(.mouseEventClickState, value: clickState)
+            post(event)
+
+        case let .scroll(frame, flags):
+            postScroll(frame, flags: flags)
+
+        case .declareUserActivity:
+            var id = userActivityAssertion
+            let result = IOPMAssertionDeclareUserActivity("iKey input" as CFString, kIOPMUserActiveLocal, &id)
+            if result == kIOReturnSuccess { userActivityAssertion = id }
+
+        case let .selectPreviousInputSource(fallback):
+            if !inputSources.selectPrevious() { post(fallback) }
+        }
+    }
+
+    private func postKey(_ code: UInt16, down: Bool, flags: ModifierFlags, autorepeat: Bool, flagsChanged: Bool) {
+        // A key the user's remap disables ("No Action") posts nothing.
+        guard code != KeyRemap.noAction,
+              let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(code), keyDown: down)
+        else { return }
+        if flagsChanged { event.type = .flagsChanged }
+        event.flags = CGEventFlags(rawValue: flags.rawValue)
+        event.setIntegerValueField(.keyboardEventAutorepeat, value: autorepeat ? 1 : 0)
+        post(event)
+    }
+
+    /// NX_SYSDEFINED / NX_SUBTYPE_AUX_CONTROL_BUTTONS: brightness, volume and media keys.
+    private func postAux(_ key: Int, down: Bool, autorepeat: Bool, flags: ModifierFlags) {
+        let state = down ? 0xA : 0xB
+        let modifierFlags = NSEvent.ModifierFlags(rawValue: UInt(state << 8) | UInt(flags.rawValue & 0xFFFF_0000))
+        let data1 = (key << 16) | (state << 8) | (autorepeat ? 1 : 0)
+        let event = NSEvent.otherEvent(with: .systemDefined, location: .zero, modifierFlags: modifierFlags,
+                                       timestamp: 0, windowNumber: 0, context: nil, subtype: 8,
+                                       data1: data1, data2: -1)
+        post(event?.cgEvent)
+    }
+
+    /// A continuous (trackpad-style) pixel scroll with its gesture and momentum phases.
+    private func postScroll(_ frame: ScrollFrame, flags: ModifierFlags) {
+        guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
+                                  wheel1: frame.pointY, wheel2: frame.pointX, wheel3: 0) else { return }
+        event.flags = CGEventFlags(rawValue: flags.rawValue)
+        event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        event.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(frame.pointY))
+        event.setIntegerValueField(.scrollWheelEventPointDeltaAxis2, value: Int64(frame.pointX))
+        event.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: frame.fixedY)
+        event.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: frame.fixedX)
+        event.setIntegerValueField(.scrollWheelEventDeltaAxis1, value: Int64(frame.lineY))
+        event.setIntegerValueField(.scrollWheelEventDeltaAxis2, value: Int64(frame.lineX))
+        event.setIntegerValueField(.scrollWheelEventScrollPhase, value: frame.phase)
+        event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: frame.momentum)
+        post(event)
+    }
+
+    private func post(_ event: CGEvent?) {
+        guard let event else { return }
+        event.setIntegerValueField(.eventSourceUserData, value: Self.userData)
         event.post(tap: .cghidEventTap)
     }
 
-    private func postModifierFlags(code: UInt16) {
-        let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(code), keyDown: false)
-        event?.type = .flagsChanged
-        event?.flags = flags
-        event?.post(tap: .cghidEventTap)
-    }
-
-    private var cursor: CGPoint {
-        CGEvent(source: nil)?.location ?? CGPoint(x: CGDisplayBounds(CGMainDisplayID()).midX,
-                                                y: CGDisplayBounds(CGMainDisplayID()).midY)
-    }
-
-    private func move(dx: Double, dy: Double) {
-        let origin = cursor
-        let position = visiblePoint(CGPoint(x: origin.x + dx, y: origin.y + dy))
-        let type: CGEventType = leftDown ? .leftMouseDragged : (rightDown ? .rightMouseDragged : .mouseMoved)
-        let button: CGMouseButton = leftDown ? .left : (rightDown ? .right : .left)
-        let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: position, mouseButton: button)
-        event?.flags = flags
-        event?.post(tap: .cghidEventTap)
-    }
-
-    /// Quartz display coordinates support negative origins and mixed display layouts.
-    private func visiblePoint(_ point: CGPoint) -> CGPoint {
-        var count: UInt32 = 0
-        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return point }
-        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
-        guard CGGetActiveDisplayList(count, &displays, &count) == .success else { return point }
-        let bounds = displays.prefix(Int(count)).map { CGDisplayBounds($0) }
-        if bounds.contains(where: { $0.contains(point) }) { return point }
-        return bounds.map { rect -> CGPoint in
-            CGPoint(x: min(max(point.x, rect.minX), rect.maxX - 0.01),
-                    y: min(max(point.y, rect.minY), rect.maxY - 0.01))
-        }.min { lhs, rhs in
-            hypot(lhs.x - point.x, lhs.y - point.y) < hypot(rhs.x - point.x, rhs.y - point.y)
-        } ?? point
-    }
-
-    private func postButton(_ button: PointerButton, down: Bool) {
-        let isLeft = button == .left
-        let wasDown = isLeft ? leftDown : rightDown
-        guard wasDown != down else { return }
-        if isLeft { leftDown = down } else { rightDown = down }
-        let location = cursor
-        let name = isLeft ? "left" : "right"
-        if down {
-            let now = ProcessInfo.processInfo.systemUptime
-            let previous = clicks[name]
-            let isRepeated = previous.map {
-                now - $0.time <= NSEvent.doubleClickInterval && hypot(location.x - $0.location.x, location.y - $0.location.y) <= 5
-            } ?? false
-            clicks[name] = Click(time: now, location: location,
-                                 count: isRepeated ? min((previous?.count ?? 0) + 1, 3) : 1)
+    /// Sets the system lock and verifies it. When that fails in `.system` mode, Caps Lock falls
+    /// back to the virtual mode (the menu shows it). The press that failed is not replayed: the
+    /// user presses Caps Lock again (accepted in the plan amendments). In
+    /// `.switchesInputSource` mode only this hold-to-toggle is dropped: the mode is kept so that
+    /// taps still switch the input source (they never need the hardware lock).
+    private func setCapsLock(_ on: Bool) {
+        guard !CapsLockHardware.set(on) else { return }
+        if settings.capsMode == .switchesInputSource {
+            Self.log.error("Caps Lock could not be set to \(on, privacy: .public); hold ignored, input-source switching kept")
+            return
         }
-        let type: CGEventType = isLeft ? (down ? .leftMouseDown : .leftMouseUp) : (down ? .rightMouseDown : .rightMouseUp)
-        let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: location,
-                            mouseButton: isLeft ? .left : .right)
-        event?.flags = flags
-        event?.setIntegerValueField(.mouseEventClickState, value: clicks[name]?.count ?? 1)
-        event?.post(tap: .cghidEventTap)
+        guard !capsHardwareFailed else { return }
+        capsHardwareFailed = true
+        Self.log.error("Caps Lock could not be set to \(on, privacy: .public); using virtual Caps Lock")
+        rebuildSettings()
     }
 
-    private func scroll(dx: Double, dy: Double) {
-        scrollRemainder.x += dx
-        scrollRemainder.y += dy
-        let x = Int32(scrollRemainder.x.rounded(.towardZero))
-        let y = Int32(scrollRemainder.y.rounded(.towardZero))
-        scrollRemainder.x -= CGFloat(x)
-        scrollRemainder.y -= CGFloat(y)
-        guard x != 0 || y != 0 else { return }
-        let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
-                            wheelCount: 2, wheel1: y, wheel2: x, wheel3: 0)
-        event?.flags = flags
-        event?.post(tap: .cghidEventTap)
+    // MARK: - Key remap
+
+    /// Re-reads the remap every `remapRefreshInterval` whether or not input arrives (amendment
+    /// C: "on each preferences poll"), so a remap changed while iKey is idle is applied, and the
+    /// iPad's tap-only keys updated, before the next keystroke.
+    private func startRemapTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.setEventHandler { [weak self] in self?.refreshKeyRemap(at: EventInjector.now) }
+        timer.schedule(deadline: .now() + Self.remapRefreshInterval, repeating: Self.remapRefreshInterval,
+                       leeway: .milliseconds(250))
+        timer.resume()
+        remapTimer = timer
+    }
+
+    /// Reads the remap off the main queue (hidutil runs as a child process with a timeout)
+    /// and applies it when it changed. Layers whose read fails keep their last good pairs.
+    private func refreshKeyRemap(at now: TimeInterval) {
+        guard !remapReadInFlight else { return }
+        remapReadInFlight = true
+        lastRemapRead = now
+        let lastGood = remapLayers
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = KeyRemapReader.read(lastGood: lastGood)
+            DispatchQueue.main.async { self?.keyRemapRead(result) }
+        }
+    }
+
+    private func keyRemapRead(_ result: KeyRemapReader.ReadResult) {
+        remapReadInFlight = false
+        remapLayers = result.layers
+        if result.failed != lastRemapFailures {
+            lastRemapFailures = result.failed
+            let failed = result.failed.joined(separator: ", ")
+            if result.failed.isEmpty {
+                Self.log.notice("Key remap reads recovered")
+            } else {
+                Self.log.error("Key remap read failed for [\(failed, privacy: .public)]; keeping their last read pairs")
+            }
+        }
+        let remap = result.remap
+        guard remap != keyRemap else { return }
+        keyRemap = remap
+        let pairs = remap.map.sorted { $0.key < $1.key }.map { "\($0.key)→\($0.value)" }.joined(separator: ", ")
+        let sources = remap.sources.map(\.rawValue).joined(separator: ", ")
+        Self.log.notice("Key remap [\(pairs, privacy: .public)] from [\(sources, privacy: .public)]")
+        rebuildSettings()
+        onKeyRemapChanged?(remap)
+    }
+}
+
+// MARK: - Input source switching
+
+/// Selects the previously selected keyboard input source, as Caps Lock (with 'Use Caps Lock to
+/// switch to and from ABC/last used') and a Globe tap set to 'Change Input Source' do. The
+/// history is kept from the system's selection-change notifications, delivered immediately even
+/// while iKey (a menu-bar agent that is almost never active) is inactive. Main-queue confined.
+private final class InputSourceHistory: NSObject {
+    private struct Source {
+        let id: String
+        let ref: TISInputSource
+        /// False for sources such as Korean 2-Set or Japanese Kana that cannot type ASCII.
+        let asciiCapable: Bool
+    }
+
+    private static let abcID = "com.apple.keylayout.ABC"
+
+    private var current: String?
+    private var previous: String?
+    /// The most recently seen source that cannot type ASCII, for the "to and from ABC" fallback.
+    private var lastNonASCII: String?
+
+    override init() {
+        super.init()
+        noteCurrent()
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(selectionChanged(_:)),
+            name: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
+            object: nil, suspensionBehavior: .deliverImmediately)
+    }
+
+    deinit {
+        DistributedNotificationCenter.default().removeObserver(self)
+    }
+
+    @objc private func selectionChanged(_ notification: Notification) {
+        if Thread.isMainThread {
+            noteCurrent()
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.noteCurrent() }
+        }
+    }
+
+    /// Selects the previous source. Without a usable history: with exactly two selectable
+    /// sources, the other one; with more, "to and from ABC" (from a non-ASCII source to ABC or
+    /// another ASCII layout, otherwise to the last seen non-ASCII source, else the first one).
+    /// False when there is no target or TIS refuses the selection (the caller then posts the
+    /// shortcut chord instead).
+    func selectPrevious() -> Bool {
+        noteCurrent()
+        guard let currentID = current else { return false }
+        let sources = Self.selectableSources()
+        var target = sources.first { $0.id == previous && $0.id != currentID }
+        if target == nil, let currentSource = sources.first(where: { $0.id == currentID }) {
+            if sources.count == 2 {
+                target = sources.first { $0.id != currentID }
+            } else {
+                target = asciiToggleTarget(from: currentSource, in: sources)
+            }
+        }
+        guard let target, TISSelectInputSource(target.ref) == OSStatus(noErr) else { return false }
+        previous = currentID
+        current = target.id
+        if !target.asciiCapable { lastNonASCII = target.id }
+        return true
+    }
+
+    private func asciiToggleTarget(from currentSource: Source, in sources: [Source]) -> Source? {
+        let others = sources.filter { $0.id != currentSource.id }
+        if currentSource.asciiCapable {
+            return others.first { $0.id == lastNonASCII && !$0.asciiCapable } ?? others.first { !$0.asciiCapable }
+        }
+        return others.first { $0.id == Self.abcID } ?? others.first { $0.asciiCapable }
+    }
+
+    private func noteCurrent() {
+        guard let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+              let id = Self.id(of: source) else { return }
+        if !Self.isASCIICapable(source) { lastNonASCII = id }
+        guard id != current else { return }
+        if current != nil { previous = current }
+        current = id
+    }
+
+    private static func id(of source: TISInputSource) -> String? {
+        guard let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else { return nil }
+        return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
+    }
+
+    /// Unknown counts as ASCII-capable (a plain layout).
+    private static func isASCIICapable(_ source: TISInputSource) -> Bool {
+        guard let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsASCIICapable) else { return true }
+        return CFBooleanGetValue(Unmanaged<CFBoolean>.fromOpaque(raw).takeUnretainedValue())
+    }
+
+    /// Enabled keyboard layouts and input modes that can be selected.
+    private static func selectableSources() -> [Source] {
+        let filter: [String: Any] = [
+            kTISPropertyInputSourceCategory as String: kTISCategoryKeyboardInputSource as String,
+            kTISPropertyInputSourceIsSelectCapable as String: true,
+        ]
+        guard let list = TISCreateInputSourceList(filter as CFDictionary, false)?.takeRetainedValue(),
+              let sources = list as? [TISInputSource] else { return [] }
+        return sources.compactMap { source in
+            id(of: source).map { Source(id: $0, ref: source, asciiCapable: isASCIICapable(source)) }
+        }
+    }
+}
+
+// MARK: - Key remap detection
+
+/// Reads the user's key remapping from every layer posted events bypass. Safe off the main
+/// queue. Merge order and conflict policy are `KeyRemap.merged`'s.
+private enum KeyRemapReader {
+    private static let hidutilTimeout: TimeInterval = 2.0
+    private static let modifierMappingPrefix = "com.apple.keyboard.modifiermapping."
+
+    /// Each layer's pairs as last read successfully.
+    struct Layers {
+        var hidutil: [UInt16: UInt16] = [:]
+        var modifierKeys: [UInt16: UInt16] = [:]
+        var karabiner: [UInt16: UInt16] = [:]
+    }
+
+    struct ReadResult {
+        var remap: KeyRemap
+        /// `lastGood` with every successfully read layer replaced.
+        var layers: Layers
+        /// Names of the layers whose read failed (they kept their `lastGood` pairs).
+        var failed: [String]
+    }
+
+    /// Reads every layer. A layer whose read fails (hidutil cannot run, times out or exits
+    /// non-zero; karabiner.json exists but cannot be read or parsed; the Modifier Keys data
+    /// cannot be serialised) keeps its `lastGood` pairs instead of counting as "no remap".
+    /// Only a successful read that finds nothing (`(null)`, no file, no mappings) clears a layer.
+    static func read(lastGood: Layers) -> ReadResult {
+        var layers = lastGood
+        var failed: [String] = []
+        if let pairs = hidutil() { layers.hidutil = pairs } else { failed.append(KeyRemapSource.hidutil.rawValue) }
+        if let pairs = modifierKeys() { layers.modifierKeys = pairs } else { failed.append(KeyRemapSource.modifierKeys.rawValue) }
+        if let pairs = karabiner() { layers.karabiner = pairs } else { failed.append(KeyRemapSource.karabiner.rawValue) }
+        let remap = KeyRemap.merged(hidutil: layers.hidutil, modifierKeys: layers.modifierKeys,
+                                    karabiner: layers.karabiner, manual: nil)
+        return ReadResult(remap: remap, layers: layers, failed: failed)
+    }
+
+    /// `hidutil property --get UserKeyMapping`; nil when it cannot run, times out or fails.
+    private static func hidutil() -> [UInt16: UInt16]? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/hidutil")
+        process.arguments = ["property", "--get", "UserKeyMapping"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        do { try process.run() } catch { return nil }
+        // The output is a few hundred bytes, well within the pipe buffer, so it is read after
+        // the exit; a child that hangs (or blocks on a full pipe) is killed at the timeout.
+        guard exited.wait(timeout: .now() + hidutilTimeout) == .success else {
+            process.terminate()
+            return nil
+        }
+        guard process.terminationStatus == 0 else { return nil }
+        let output = pipe.fileHandleForReading.readDataToEndOfFile()
+        return KeyRemap.parseHidutil(String(decoding: output, as: UTF8.self))
+    }
+
+    /// System Settings > Keyboard > Modifier Keys for the built-in keyboard (ByHost globals);
+    /// [:] when none are set, nil when the stored values cannot be serialised.
+    private static func modifierKeys() -> [UInt16: UInt16]? {
+        let app: CFString = kCFPreferencesAnyApplication, user: CFString = kCFPreferencesCurrentUser
+        let host: CFString = kCFPreferencesCurrentHost
+        CFPreferencesSynchronize(app, user, host)
+        guard let keys = CFPreferencesCopyKeyList(app, user, host) as? [String] else { return [:] }
+        var mappings: [String: Any] = [:]
+        for key in keys where key.hasPrefix(modifierMappingPrefix) {
+            if let value = CFPreferencesCopyValue(key as CFString, app, user, host) { mappings[key] = value }
+        }
+        guard !mappings.isEmpty else { return [:] }
+        guard let data = try? PropertyListSerialization.data(fromPropertyList: mappings, format: .binary, options: 0)
+        else { return nil }
+        return KeyRemap.parseModifierMappings(data, keyboard: builtInKeyboardID())
+    }
+
+    /// The built-in keyboard's decimal "<vendorID>-<productID>" from the IORegistry (no HID
+    /// access permission needed); nil when none is found.
+    private static func builtInKeyboardID() -> String? {
+        var iterator: io_iterator_t = 0
+        let matching = IOServiceMatching("IOHIDDevice")
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(iterator) }
+        while case let service = IOIteratorNext(iterator), service != 0 {
+            defer { IOObjectRelease(service) }
+            guard (property(service, "Built-In") as? NSNumber)?.boolValue == true,
+                  (property(service, "PrimaryUsagePage") as? NSNumber)?.intValue == 1,
+                  (property(service, "PrimaryUsage") as? NSNumber)?.intValue == 6,
+                  let vendor = (property(service, "VendorID") as? NSNumber)?.intValue,
+                  let product = (property(service, "ProductID") as? NSNumber)?.intValue else { continue }
+            return "\(vendor)-\(product)"
+        }
+        return nil
+    }
+
+    private static func property(_ service: io_service_t, _ key: String) -> Any? {
+        IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
+    }
+
+    /// Karabiner-Elements simple modifications for the built-in keyboard; [:] without a
+    /// karabiner.json, nil when it exists but cannot be read or is not valid JSON (e.g. caught
+    /// mid-write).
+    private static func karabiner() -> [UInt16: UInt16]? {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/karabiner/karabiner.json")
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        guard let data = try? Data(contentsOf: url),
+              (try? JSONSerialization.jsonObject(with: data, options: [])) != nil else { return nil }
+        return KeyRemap.parseKarabiner(data)
     }
 }

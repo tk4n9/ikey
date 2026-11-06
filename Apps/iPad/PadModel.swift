@@ -1,269 +1,463 @@
 import Foundation
 import Combine
+import SwiftUI
 import UIKit
 import ImageIO
 import Network
+import os
 import IKeyCore
 
 struct MacPeer: Identifiable {
     let id: String
     let name: String
     let endpoint: NWEndpoint
+    /// Protocol from the Bonjour TXT record (1 = a Mac that needs updating).
+    let proto: Int
+    /// The Mac's TXT `id`, when advertised.
+    let macID: UUID?
 }
 
-/// Networking callbacks and UI state are confined to the main queue.
+extension SecureParameters {
+    /// Offer the ECDHE-PSK suite; the integration pass flips it after the macOS loopback test.
+    static let offerForwardSecrecyEnabled = false
+}
+
+/// The iPad's session with its paired Mac. Networking callbacks and UI state are confined to the
+/// main queue. `ConnectionSupervisor` decides when to connect; this class executes its commands.
 final class PadModel: ObservableObject {
-    @Published var peers: [MacPeer] = []
+    // MARK: Published state
+
+    @Published var preferences: PadPreferences {
+        didSet { preferencesChanged(from: oldValue) }
+    }
+    /// The supervisor's state. A `.connected` value is not re-published when only `lastHeard`
+    /// moves, so views do not redraw for every message from the Mac.
+    @Published private(set) var linkState: LinkState
+    @Published private(set) var problemSince: Double?
+    @Published private(set) var macName: String?
+    @Published private(set) var welcome: Welcome?
+    @Published private(set) var macPrefs: MacInputPreferences?
+    @Published private(set) var capsLockOn = false
+    @Published private(set) var detectedMacModel: MacBookAirModel?
+    @Published private(set) var isPaired = false
+    /// Ping round trip in seconds over the current session (nil until the first pong).
+    @Published private(set) var rttP50: Double?
+    @Published private(set) var rttP95: Double?
+    /// Modifier key codes the live Mac's key remap makes tap-only (`MacState.tapOnly`); kept per Mac
+    /// across launches so the deck is right before the first state message.
+    @Published private(set) var macTapOnlyCodes: Set<UInt16> = []
+    @Published var isPanelPresented = false {
+        didSet { if isPanelPresented != oldValue { inputModeMayHaveChanged() } }
+    }
+    @Published var isFitPresented = false {
+        didSet { if isFitPresented != oldValue { inputModeMayHaveChanged() } }
+    }
+    /// Fit & Size live preview; never persisted.
+    @Published var previewPlacement: DeckPlacement?
+    @Published private(set) var projection: ProjectionResolution?
+    /// The Mac's last goodbye; kept across suspension, cleared by the next welcome.
+    @Published private(set) var lastGoodbye: GoodbyeReason?
+
+    // Legacy members (pairing sheet, calibration, photo mode).
+    @Published private(set) var peers: [MacPeer] = []
     @Published var selectedPeerID = ""
     @Published var pairingText = ""
-    @Published var status = "Not connected"
     @Published var message: String?
-    @Published var isConnected = false
-    @Published var isConnecting = false
     @Published private(set) var isRefreshing = false
     @Published private(set) var discoveryStatus = "Search for your Mac after starting its receiver."
-    @Published var isSettingsPresented = true
     @Published private(set) var photo: UIImage?
     @Published private(set) var layout = DeckLayout.macBookANSI
     @Published private(set) var resetGeneration = 0
-    @Published var touchProtection = TouchProtectionSettings() {
-        didSet {
-            guard touchProtection != oldValue else { return }
-            if let data = try? JSONEncoder().encode(touchProtection) {
-                UserDefaults.standard.set(data, forKey: PreferenceKey.touchProtection)
-            }
-            resetTouchInput()
+
+    @Published private var scenePhase: ScenePhase = .active
+    /// Screen brightness below the Auto glow threshold.
+    @Published private var lowLight = false
+    @Published private var unpairedSheetDismissed = false
+
+    // MARK: Derived state
+
+    var deckInputMode: DeckInputMode {
+        if scenePhase == .background { return .off }
+        guard case .connected = linkState, !isPanelPresented, !isFitPresented, scenePhase == .active else {
+            return .panelOnly
+        }
+        // Windowed or rotated scenes pause input. An unknown iPad keeps a usable scaled deck
+        // (amendment E: the fitting mode exists for unknown devices, with a banner).
+        if let projection, projection.fit == .windowed, preferences.appearance.mode != .photo {
+            return .panelOnly
+        }
+        return .live
+    }
+
+    var effectiveTrackpad: TrackpadSettings { preferences.effectiveTrackpad(mac: macPrefs) }
+
+    /// The user's typing settings plus the live Mac's tap-only keys (amendment H).
+    var effectiveTyping: TypingSettings {
+        var typing = preferences.typing
+        typing.tapOnlyCodes.formUnion(macTapOnlyCodes)
+        return typing
+    }
+
+    var effectiveModel: MacBookAirModel {
+        let appearance = preferences.appearance
+        return appearance.modelIsManual ? appearance.model : (detectedMacModel ?? appearance.model)
+    }
+
+    var effectiveFinish: DeckFinish {
+        let model = effectiveModel
+        if let finish = preferences.appearance.finish, model.finishes.contains(finish) { return finish }
+        return model.defaultFinish
+    }
+
+    /// Off 0, on 1; auto follows the screen brightness (below 0.3 → 1).
+    var keyboardGlowLevel: Double {
+        switch preferences.appearance.glow {
+        case .off: return 0
+        case .on: return 1
+        case .auto: return lowLight ? 1 : 0
         }
     }
-    @Published var showTouchIndicators = false {
-        didSet {
-            guard showTouchIndicators != oldValue else { return }
-            UserDefaults.standard.set(showTouchIndicators, forKey: PreferenceKey.showTouchIndicators)
-            resetTouchInput()
+
+    var inputEnabled: Bool { deckInputMode == .live }
+
+    var isConnected: Bool {
+        if case .connected = linkState { return true }
+        return false
+    }
+
+    var isConnecting: Bool {
+        switch linkState {
+        case .connecting, .awaitingWelcome: return true
+        default: return false
         }
     }
-    @Published private var sceneIsActive = true
 
-    private enum PreferenceKey {
-        static let touchProtection = "iKey.touchProtection.v1"
-        static let showTouchIndicators = "iKey.showTouchIndicators.v1"
+    var status: String {
+        let name = macName ?? "your Mac"
+        switch linkState {
+        case .unpaired: return "Not paired"
+        case .suspended: return "Paused"
+        case .backoff, .connecting, .awaitingWelcome: return "Connecting to \(name)…"
+        case .connected: return "Connected to \(name)"
+        case .replaced:
+            return lastGoodbye == .replaced ? "In use by another iPad — touch to switch" : "Disconnected"
+        case .macTooOld:
+            return lastGoodbye == .protocolMismatch ? "Update iKey" : "Update iKey on your Mac"
+        case .needsRepair: return "Can't reach \(name) — the pairing key may have changed"
+        }
     }
-
-    private var browser: NWBrowser?
-    private var stream: EventStream?
-    private var heartbeat: Timer?
-    private var connectTimeout: DispatchWorkItem?
-    private var discoveryTimeout: DispatchWorkItem?
-    private var attemptID: UUID?
-    private let store = PadStore()
-
-    var inputEnabled: Bool { isConnected && !isSettingsPresented && sceneIsActive }
 
     var canConnect: Bool {
-        !isConnecting && peers.contains(where: { $0.id == selectedPeerID }) &&
-        !pairingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard !isConnecting, !isConnected else { return false }
+        if isPaired && trimmedPairingText.isEmpty { return true }
+        return peers.contains(where: { $0.id == selectedPeerID }) && !trimmedPairingText.isEmpty
     }
 
     var connectionHint: String? {
-        if isConnected || isConnecting { return nil }
+        if isConnected || isConnecting || isPaired { return nil }
         if peers.isEmpty { return "Connect becomes available when your Mac appears in the list and you enter its pairing key." }
         if !peers.contains(where: { $0.id == selectedPeerID }) { return "Choose a Mac from the list above." }
-        if pairingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Paste the pairing key from the selected Mac to enable Connect." }
+        if trimmedPairingText.isEmpty { return "Paste the pairing key from the selected Mac to enable Connect." }
         return nil
     }
 
+    /// The legacy root's sheet: the panel, or the pairing sheet while unpaired.
+    var isSettingsPresented: Bool {
+        get { isPanelPresented || (!isPaired && !unpairedSheetDismissed) }
+        set {
+            isPanelPresented = newValue
+            unpairedSheetDismissed = !newValue
+        }
+    }
+
+    var touchProtection: TouchProtectionSettings {
+        get { preferences.protection }
+        set { preferences.protection = newValue }
+    }
+
+    var showTouchIndicators: Bool {
+        get { preferences.showTouchIndicators }
+        set { preferences.showTouchIndicators = newValue }
+    }
+
+    // MARK: Private state
+
+    private enum Key {
+        static let pairing = "iKey.pairing.v2"
+        static let clientID = "iKey.clientID"
+        static let macTapOnly = "iKey.macTapOnly.v1"
+        static let v1TouchProtection = "iKey.touchProtection.v1"
+        static let v1ShowIndicators = "iKey.showTouchIndicators.v1"
+    }
+
+    private struct PairingRecord: Codable, Equatable {
+        var macID: UUID
+        var macName: String
+        var lastServiceName: String
+        var knownGoodHosts: [String]
+    }
+
+    private static let log = Logger(subsystem: "com.ikey.pad", category: "session")
+    private static let maxKnownGoodHosts = 8
+    private static let glowBrightness = 0.3
+    /// A close this soon after hello, without a welcome, is how a v1 receiver refuses v2.
+    private static let closedAfterHelloWindow = 1.0
+    private static let goodbyeGrace = 1.0
+
+    private var supervisor: ConnectionSupervisor
+    private var record: PairingRecord?
+    private var pairedSecret: PairingSecret?
+    private var pendingPairing: PendingPairing?
+    private var attempt: LinkAttempt?
+    /// Streams closing with a goodbye stay alive until it is handed to the network.
+    private var closingStreams: [ObjectIdentifier: PadLinkStream] = [:]
+    private let clientID: UUID
+
+    private var browser: NWBrowser?
+    private var browsingWanted = false
+    private var discoveryTimeout: DispatchWorkItem?
+    private var pairedEndpoint: NWEndpoint?
+    private var pairedMatchedByID = false
+    /// TXT proto of the paired Mac's current advert; nil while it is not advertised.
+    private var pairedAdvertProto: Int?
+    private let pathMonitor = NWPathMonitor()
+    private var pathSatisfied: Bool?
+
+    private var tickTimer: Timer?
+    private var linkTimer: Timer?
+    private var heartbeatSeq: UInt32 = 0
+    private var lastHeartbeatAt = -Double.infinity
+    private var pingID: UInt32 = 0
+    private var lastPingAt = -Double.infinity
+    private var latency = LatencyStats()
+    private var heldKeys: Set<UInt16> = []
+    private var heldButtons: Set<PointerButton> = []
+    private var heldActive = false
+    /// The Mac whose tap-only codes are in `macTapOnlyCodes`.
+    private var tapOnlyMacID: UUID?
+
+    private var lastInputMode: DeckInputMode = .panelOnly
+    private var loggedLegacyDrop = false
+    private var brightnessObserver: NSObjectProtocol?
+    private let store = PadStore()
+
+    private var now: Double { ProcessInfo.processInfo.systemUptime }
+    private var trimmedPairingText: String { pairingText.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    // MARK: Init
+
     init() {
+        let defaults = UserDefaults.standard
+        let savedPreferences = defaults.data(forKey: PadPreferences.storageKey)
+            .flatMap { try? JSONDecoder().decode(PadPreferences.self, from: $0) }
+        let record = defaults.data(forKey: Key.pairing)
+            .flatMap { try? JSONDecoder().decode(PairingRecord.self, from: $0) }
+        let secret = record.flatMap { PadKeychain.load(macID: $0.macID) }
+        let paired = record != nil && secret != nil
+        let supervisor = ConnectionSupervisor(paired: paired)
+        // Stored properties without defaults first; the rest go through their setters.
+        preferences = savedPreferences ?? .migrated(
+            v1TouchProtection: defaults.data(forKey: Key.v1TouchProtection),
+            v1ShowIndicators: defaults.object(forKey: Key.v1ShowIndicators) as? Bool)
+        linkState = supervisor.state
+        self.supervisor = supervisor
+        clientID = PadModel.loadClientID()
+
+        self.record = record
+        pairedSecret = secret
+        isPaired = paired
+        macName = record?.macName
+        if let macID = record?.macID {
+            tapOnlyMacID = macID
+            macTapOnlyCodes = Self.storedTapOnly(for: macID)
+        }
+
         do { layout = try store.loadLayout() ?? .macBookANSI }
         catch { message = "Saved calibration could not be loaded. The default layout is active." }
         photo = store.loadPhoto()
-        let preferences = UserDefaults.standard
-        if let data = preferences.data(forKey: PreferenceKey.touchProtection),
-           let saved = try? JSONDecoder().decode(TouchProtectionSettings.self, from: data) {
-            touchProtection = saved
-        }
-        showTouchIndicators = preferences.object(forKey: PreferenceKey.showTouchIndicators) as? Bool ?? false
+
+        if savedPreferences == nil { savePreferences() }
+        startObservers()
+        // The supervisor has no clock until its first input; `.active` also starts a paired attempt.
+        handle(.active)
     }
 
-    func startDiscovery() {
-        stopDiscovery()
-        peers = []
-        isRefreshing = true
-        discoveryStatus = "Searching for Macs…"
-        let parameters = NWParameters.tcp
-        parameters.includePeerToPeer = true
-        let next = NWBrowser(for: .bonjour(type: IKeyService.bonjourType, domain: nil), using: parameters)
-        browser = next
-        next.browseResultsChangedHandler = { [weak self, weak next] results, _ in
-            guard let self, let next, self.browser === next else { return }
-            self.peers = results.compactMap { result in
-                guard case let .service(name, _, _, _) = result.endpoint else { return nil }
-                return MacPeer(id: String(describing: result.endpoint), name: name, endpoint: result.endpoint)
-            }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-            if !self.peers.contains(where: { $0.id == self.selectedPeerID }) {
-                self.selectedPeerID = self.peers.first?.id ?? ""
-            }
-            if !self.peers.isEmpty {
-                self.discoveryTimeout?.cancel()
-                self.discoveryTimeout = nil
-                self.isRefreshing = false
-                self.discoveryStatus = self.peers.count == 1 ? "Found 1 Mac." : "Found \(self.peers.count) Macs."
-            } else if case .ready = next.state {
-                self.waitForDiscoveryResults(from: next)
-            }
-        }
-        next.stateUpdateHandler = { [weak self, weak next] state in
-            guard let self, let next, self.browser === next else { return }
-            switch state {
-            case .failed(let error), .waiting(let error):
-                self.discoveryTimeout?.cancel()
-                self.discoveryTimeout = nil
-                self.isRefreshing = false
-                if case .dns(let code) = error, code == -65570 {
-                    self.discoveryStatus = "Local Network access is blocked. Enable iKey in Settings → Privacy & Security → Local Network, then refresh."
-                } else {
-                    self.discoveryStatus = "Discovery is unavailable. Check Wi-Fi on both devices, then refresh."
-                }
-            case .ready:
-                if self.peers.isEmpty {
-                    self.waitForDiscoveryResults(from: next)
-                } else {
-                    self.isRefreshing = false
-                    self.discoveryStatus = self.peers.count == 1 ? "Found 1 Mac." : "Found \(self.peers.count) Macs."
-                }
-            default: break
-            }
-        }
-        next.start(queue: .main)
-    }
-
-    private func waitForDiscoveryResults(from browser: NWBrowser) {
-        discoveryTimeout?.cancel()
-        isRefreshing = true
-        discoveryStatus = "Searching for Macs…"
-        let timeout = DispatchWorkItem { [weak self, weak browser] in
-            guard let self, let browser, self.browser === browser, self.peers.isEmpty else { return }
-            self.isRefreshing = false
-            self.discoveryStatus = "No Macs found yet. On your Mac, start iKey's receiver and wait for Ready. Keep both devices on the same Wi-Fi network."
-            // Keep browsing: a receiver started later should still appear.
-        }
-        discoveryTimeout = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: timeout)
-    }
-
-    private func stopDiscovery() {
-        discoveryTimeout?.cancel()
-        discoveryTimeout = nil
-        browser?.stateUpdateHandler = nil
-        browser?.browseResultsChangedHandler = nil
+    deinit {
+        tickTimer?.invalidate()
+        linkTimer?.invalidate()
+        pathMonitor.cancel()
         browser?.cancel()
-        browser = nil
-        isRefreshing = false
+        attempt?.stream.cancel()
+        if let brightnessObserver { NotificationCenter.default.removeObserver(brightnessObserver) }
     }
 
+    // MARK: Deck callbacks
+
+    /// Deck output stamped with the touch time (seconds on the system-uptime clock).
+    func send(_ inputs: [PadInput], at touchTime: TimeInterval) {
+        guard deckInputMode == .live, let stream = liveStream else { return }
+        let batch = PadInput.coalesced(inputs)
+        guard !batch.isEmpty else { return }
+        let t = Self.micros(touchTime.isFinite ? touchTime : now)
+        stream.send(batch.map { PadMessage.input($0, t: t) })
+    }
+
+    /// Legacy events (calibration preview and the photo path): keys, clicks and release-all.
+    func send(_ event: InputEvent) {
+        let input: PadInput
+        switch event {
+        case .key(let code, let down):
+            input = .key(code: code, down: down)
+        case .button(let button, let down):
+            input = .button(button: button, down: down, clickState: 1)
+        case .releaseAll:
+            input = .releaseAll
+        case .pointer, .scroll:
+            if !loggedLegacyDrop {
+                loggedLegacyDrop = true
+                Self.log.info("Dropping legacy pointer/scroll events: protocol v2 needs mm motion")
+            }
+            return
+        case .heartbeat:
+            return
+        }
+        send([input], at: now)
+    }
+
+    func updateHeldSnapshot(keys: Set<UInt16>, buttons: Set<PointerButton>, active: Bool) {
+        heldKeys = keys
+        heldButtons = buttons
+        heldActive = active
+    }
+
+    func deckTouchedWhileDisconnected() {
+        handle(.deckTouched)
+    }
+
+    func projectionResolved(_ r: ProjectionResolution) {
+        guard r != projection else { return }
+        projection = r
+        refreshBrightness()
+        inputModeMayHaveChanged()
+    }
+
+    // MARK: Scene
+
+    func scenePhaseChanged(_ phase: ScenePhase) {
+        guard phase != scenePhase else { return }
+        scenePhase = phase
+        switch phase {
+        case .active:
+            refreshBrightness()
+            handle(.active)
+        case .inactive:
+            handle(.inactive)
+        case .background:
+            handle(.background)
+        @unknown default:
+            break
+        }
+    }
+
+    /// Legacy root: active / inactive only.
+    func sceneActiveChanged(_ active: Bool) {
+        scenePhaseChanged(active ? .active : .inactive)
+    }
+
+    // MARK: User actions
+
+    /// Pairs with the selected Mac using the pasted key, or reconnects the paired Mac when no key
+    /// is pasted. The pasted key is cleared only after the Mac's welcome.
     func connect() {
+        let text = trimmedPairingText
+        if text.isEmpty {
+            guard isPaired else {
+                message = "Paste the pairing key shown by iKey on your Mac."
+                return
+            }
+            message = nil
+            handle(.userConnect)
+            // macTooOld holds the attempt while the Mac advertises protocol 1: say why nothing happens.
+            if case .macTooOld = supervisor.state { message = updateNeededMessage }
+            return
+        }
         guard let peer = peers.first(where: { $0.id == selectedPeerID }) else {
             message = "Choose a nearby Mac first."
             return
         }
-        do {
-            let secret = try PairingSecret(hex: pairingText.trimmingCharacters(in: .whitespacesAndNewlines))
-            disconnect()
-            message = nil
-            isConnecting = true
-            status = "Connecting to \(peer.name)…"
-            let id = UUID()
-            attemptID = id
-            let connection = NWConnection(to: peer.endpoint, using: SecureParameters.make(secret: secret))
-            let next = EventStream(connection: connection)
-            stream = next
-            next.onReady = { [weak self] in
-                guard let self, self.attemptID == id else { return }
-                self.connectTimeout?.cancel()
-                self.connectTimeout = nil
-                self.isConnecting = false
-                self.isConnected = true
-                self.status = "Connected to \(peer.name)"
-                self.pairingText = ""
-                self.resetGeneration += 1
-                self.stream?.send(.releaseAll)
-                self.stream?.send(.heartbeat)
-                let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-                    self?.stream?.send(.heartbeat)
-                }
-                self.heartbeat = timer
-                RunLoop.main.add(timer, forMode: .common)
-                self.updateIdleTimer()
-            }
-            next.onClose = { [weak self] reason in
-                guard let self, self.attemptID == id else { return }
-                self.disconnect()
-                self.status = "Connection ended"
-                self.message = "Reconnect to continue. Check that the Mac receiver is running and the pairing key matches. \(reason)"
-                self.isSettingsPresented = true
-            }
-            let timeout = DispatchWorkItem { [weak self] in
-                guard let self, self.attemptID == id, self.isConnecting else { return }
-                self.disconnect()
-                self.message = "Connection timed out. Check the pairing key, Wi-Fi, and the Mac receiver."
-            }
-            connectTimeout = timeout
-            DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: timeout)
-            next.start()
-        } catch {
+        guard peer.proto >= WireV2.version else {
+            message = "Update iKey on your Mac, then connect again."
+            return
+        }
+        guard let secret = try? PairingSecret(hex: text) else {
             message = "Paste the full 64-character pairing key shown by iKey on your Mac."
+            return
+        }
+        message = nil
+        // Pairing is a deliberate switch: end any attempt or link in progress (the current Mac gets
+        // a `.user` goodbye) so the pasted key is used by this action, not by a later retry.
+        switch supervisor.state {
+        case .connecting, .awaitingWelcome, .connected:
+            handle(.userDisconnect)
+        case .unpaired, .backoff, .suspended, .replaced, .macTooOld, .needsRepair:
+            break
+        }
+        pendingPairing = PendingPairing(secret: secret, peer: peer)
+        handle(.userConnect)
+        // One-shot: a pasted key that this action's attempt did not take is dropped, never left for
+        // an automatic reconnect (which could silently move the pairing to another Mac).
+        guard pendingPairing != nil else { return }
+        pendingPairing = nil
+        if case .macTooOld = supervisor.state {
+            message = "\(macName ?? "Your paired Mac") needs an iKey update. Update it, or Forget it to pair a different Mac."
+        } else {
+            message = "Could not start pairing. Try again."
         }
     }
 
-    func send(_ event: InputEvent) {
-        guard inputEnabled else { return }
-        stream?.send(event)
+    func disconnect() {
+        pendingPairing = nil
+        handle(.userDisconnect)
     }
 
-    func suspendInput() {
-        stream?.send(.releaseAll)
-        resetGeneration += 1
-        UIApplication.shared.isIdleTimerDisabled = false
+    func forgetPairing() {
+        pendingPairing = nil
+        handle(.forgot)
+        welcome = nil
+        macPrefs = nil
+        capsLockOn = false
+        rttP50 = nil
+        rttP95 = nil
+    }
+
+    /// nil returns to Auto (the model the Mac reports).
+    func noteManualModelChoice(_ model: MacBookAirModel?) {
+        var appearance = preferences.appearance
+        if let model {
+            appearance.model = model
+            appearance.modelIsManual = true
+        } else {
+            appearance.model = detectedMacModel ?? MacBookAirModel.defaultModel
+            appearance.modelIsManual = false
+        }
+        preferences.appearance = appearance
+    }
+
+    /// Restarts discovery (Refresh); does nothing while connected, when no browser should run.
+    func startDiscovery() {
+        guard browsingWanted else { return }
+        startBrowser()
     }
 
     func presentSettings() {
-        suspendInput()
-        isSettingsPresented = true
+        sendReleaseAll()
+        resetGeneration += 1
+        isPanelPresented = true
     }
 
     func settingsDismissed() {
         resetGeneration += 1
-        updateIdleTimer()
-    }
-
-    func sceneActiveChanged(_ active: Bool) {
-        sceneIsActive = active
-        if active {
-            if browser == nil { startDiscovery() }
-        } else {
-            suspendInput()
-            disconnect()
-            stopDiscovery()
-            isSettingsPresented = true
-        }
-        updateIdleTimer()
-    }
-
-    func disconnect() {
-        // Queue a release, then close. The receiver also releases on stream closure.
-        stream?.send(.releaseAll)
-        attemptID = nil
-        connectTimeout?.cancel()
-        connectTimeout = nil
-        heartbeat?.invalidate()
-        heartbeat = nil
-        let previous = stream
-        stream = nil
-        previous?.cancel()
-        isConnected = false
-        isConnecting = false
-        status = "Not connected"
-        resetGeneration += 1
-        updateIdleTimer()
+        inputModeMayHaveChanged()
     }
 
     func saveLayout(_ draft: DeckLayout) throws {
@@ -286,13 +480,637 @@ final class PadModel: ObservableObject {
         } catch { message = "Could not remove the photo: \(error.localizedDescription)" }
     }
 
-    private func resetTouchInput() {
-        stream?.send(.releaseAll)
+    // MARK: Supervisor
+
+    private func handle(_ input: LinkInput) {
+        let before = supervisor.state
+        let commands = supervisor.handle(input, now: now)
+        publishLinkState()
+        for command in commands { execute(command, input: input, stateBefore: before) }
+        updateTimers()
+        inputModeMayHaveChanged()
+    }
+
+    private func publishLinkState() {
+        let state = supervisor.state
+        if case .connected(let since, _) = state, case .connected(let shown, _) = linkState, since == shown {
+            // Only lastHeard moved.
+        } else if state != linkState {
+            linkState = state
+        }
+        if supervisor.problemSince != problemSince { problemSince = supervisor.problemSince }
+    }
+
+    private func execute(_ command: LinkCommand, input: LinkInput, stateBefore: LinkState) {
+        switch command {
+        case .openAttempt:
+            openAttempt()
+        case .cancelAttempt:
+            if case .tick = input, case .connecting = stateBefore, let attempt {
+                // Attempt timeout: the transport did not come up on this path.
+                preferences.peerToPeer.attemptFailed(usedP2P: attempt.usedP2P)
+                if attempt.pairing != nil { message = Self.pairingFailedMessage }
+            }
+            retireAttempt(goodbye: nil)
+        case .sendHello:
+            sendHello()
+        case .closeLink(let goodbye):
+            if case .tick = input, case .awaitingWelcome = stateBefore, attempt?.pairing != nil {
+                message = Self.pairingFailedMessage
+            }
+            retireAttempt(goodbye: goodbye)
+        case .releaseHeldInput:
+            sendReleaseAll()
+            resetGeneration += 1
+        case .setBrowsing(let on):
+            browsingWanted = on
+            if on {
+                if browser == nil { startBrowser() }
+            } else {
+                stopBrowser()
+            }
+        case .deletePairing:
+            deletePairing()
+        }
+    }
+
+    // MARK: Link
+
+    private var liveStream: PadLinkStream? {
+        guard let attempt, attempt.welcomed else { return nil }
+        return attempt.stream
+    }
+
+    private func openAttempt() {
+        retireAttempt(goodbye: nil)
+        let pairing = pendingPairing
+        pendingPairing = nil
+        let chosenSecret: PairingSecret?
+        let chosenEndpoint: NWEndpoint?
+        var matchedByID = false
+        if let pairing {
+            chosenSecret = pairing.secret
+            chosenEndpoint = pairing.peer.endpoint
+        } else {
+            if pairedSecret == nil, let record { pairedSecret = PadKeychain.load(macID: record.macID) }
+            chosenSecret = pairedSecret
+            if let pairedEndpoint {
+                chosenEndpoint = pairedEndpoint
+                matchedByID = pairedMatchedByID
+            } else if let name = record?.lastServiceName, !name.isEmpty {
+                // Cold launch: resolve the remembered service instead of waiting for the browser.
+                chosenEndpoint = .service(name: name, type: IKeyService.bonjourType, domain: "local.", interface: nil)
+            } else {
+                chosenEndpoint = nil
+            }
+        }
+        guard let secret = chosenSecret, let endpoint = chosenEndpoint else {
+            // No Mac to try yet: report the failure after the supervisor's current step.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, case .connecting = self.supervisor.state, self.attempt == nil else { return }
+                self.handle(.attemptFailed(authFailure: false, knownGoodHost: false))
+            }
+            return
+        }
+        let usedP2P = preferences.peerToPeer.useP2P()
+        let connection = NWConnection(to: endpoint, using: SecureParameters.make(
+            secret: secret, peerToPeer: usedP2P, offerForwardSecrecy: SecureParameters.offerForwardSecrecyEnabled))
+        let stream = PadLinkStream(connection: connection)
+        let next = LinkAttempt(stream: stream, connection: connection, secret: secret, usedP2P: usedP2P,
+                               pairing: pairing, matchedByID: matchedByID)
+        attempt = next
+        connection.pathUpdateHandler = { [weak next] path in next?.note(path) }
+        stream.onReady = { [weak self, weak next] in
+            guard let self, let next, self.attempt === next else { return }
+            self.handle(.attemptReady)
+        }
+        stream.onMessage = { [weak self, weak next] message in
+            guard let self, let next, self.attempt === next else { return }
+            self.received(message, on: next)
+        }
+        stream.onClose = { [weak self, weak next] reason in
+            guard let self, let next, self.attempt === next else { return }
+            self.closed(next, reason: reason)
+        }
+        stream.start()
+    }
+
+    private func sendHello() {
+        guard let attempt else { return }
+        let info = Bundle.main.infoDictionary
+        let hello = Hello(proto: WireV2.version, client: clientID,
+                          app: Self.wireString(info?["CFBundleShortVersionString"] as? String ?? "0"),
+                          device: Self.wireString(UIDevice.current.name),
+                          features: WireFeature.all)
+        attempt.helloSentAt = now
+        attempt.stream.send([.hello(hello)])
+    }
+
+    /// Ends the current attempt or link without reporting its close to the supervisor.
+    private func retireAttempt(goodbye: GoodbyeReason?) {
+        guard let old = attempt else { return }
+        attempt = nil
+        let stream = old.stream
+        stream.onReady = nil
+        stream.onMessage = nil
+        old.connection.pathUpdateHandler = nil
+        guard let goodbye else {
+            stream.onClose = nil
+            stream.cancel()
+            return
+        }
+        let key = ObjectIdentifier(stream)
+        closingStreams[key] = stream
+        stream.onClose = { [weak self] _ in self?.closingStreams[key] = nil }
+        stream.send([.goodbye(goodbye)])
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.goodbyeGrace) { [weak self] in
+            if let stuck = self?.closingStreams[key] { stuck.cancel() }
+        }
+    }
+
+    private func closed(_ old: LinkAttempt, reason: LinkCloseReason) {
+        attempt = nil
+        old.connection.pathUpdateHandler = nil
+        let time = now
+        if case .goodbye(let r) = reason {
+            handle(.linkClosed(r))
+        } else if old.welcomed {
+            handle(.linkClosed(nil))
+        } else if let hello = old.helloSentAt, time - hello < Self.closedAfterHelloWindow {
+            if old.pairing != nil { message = "Update iKey on your Mac, then connect again." }
+            handle(.closedAfterHello)
+        } else {
+            let host = old.remoteHost
+            let knownGood = old.matchedByID || (host.map { record?.knownGoodHosts.contains($0) ?? false } ?? false)
+            let authFailure = Self.isAuthFailure(reason, connection: old.connection)
+            // A TLS alert or PSK mismatch proves the path reached the Mac: it is not evidence
+            // against infrastructure Wi-Fi, so it must not push the policy back to P2P.
+            if !authFailure { preferences.peerToPeer.attemptFailed(usedP2P: old.usedP2P) }
+            if old.pairing != nil { message = Self.pairingFailedMessage }
+            handle(.attemptFailed(authFailure: authFailure, knownGoodHost: knownGood))
+        }
+    }
+
+    private func received(_ message: MacMessage, on link: LinkAttempt) {
+        handle(.heard)
+        switch message {
+        case .welcome(let w):
+            welcomed(w, on: link)
+        case .state(let state):
+            if let caps = state.caps, caps != capsLockOn { capsLockOn = caps }
+            if let prefs = state.prefs, prefs != macPrefs { macPrefs = prefs }
+            if let tapOnly = state.tapOnly, let mac = welcome?.mac { setTapOnly(Set(tapOnly), for: mac) }
+        case .pong(_, let echoT, _):
+            latency.add(now - Double(echoT) / 1e6)
+            let p50 = latency.percentile(50), p95 = latency.percentile(95)
+            if p50 != rttP50 { rttP50 = p50 }
+            if p95 != rttP95 { rttP95 = p95 }
+        case .goodbye(let reason):
+            lastGoodbye = reason
+        case .unknown:
+            break
+        }
+    }
+
+    private func welcomed(_ w: Welcome, on link: LinkAttempt) {
+        guard case .awaitingWelcome = supervisor.state else { return }
+        link.welcomed = true
+        welcome = w
+        macName = w.name
+        macPrefs = w.prefs
+        capsLockOn = w.caps
+        lastGoodbye = nil
+        message = nil
+        latency = LatencyStats()
+        rttP50 = nil
+        rttP95 = nil
+        heartbeatSeq = 0
+        lastHeartbeatAt = -.infinity
+        lastPingAt = -.infinity
+        if tapOnlyMacID != w.mac {
+            tapOnlyMacID = w.mac
+            macTapOnlyCodes = Self.storedTapOnly(for: w.mac)
+        }
+        detectedMacModel = MacModelCatalog.model(forHardwareModel: w.model)
+        if let detected = detectedMacModel, !preferences.appearance.modelIsManual,
+           preferences.appearance.model != detected {
+            preferences.appearance.model = detected
+        }
+        handle(.welcomeReceived)
+
+        if let path = link.connection.currentPath {
+            link.note(path)
+            preferences.peerToPeer.sessionEstablished(overInfrastructure: !LinkAttempt.isPeerToPeer(path))
+        }
+        if let pairing = link.pairing {
+            savePairing(w, secret: link.secret, peer: pairing.peer, host: link.remoteHost)
+        } else if var current = record {
+            if current.macID != w.mac {
+                // The stored key opened a different Mac ID: move the pairing to it.
+                PadKeychain.delete(macID: current.macID)
+                _ = PadKeychain.save(link.secret, macID: w.mac)
+                current.macID = w.mac
+            }
+            current.macName = w.name
+            if let host = link.remoteHost { current.knownGoodHosts = Self.adding(host, to: current.knownGoodHosts) }
+            if current != record { saveRecord(current) }
+        }
         resetGeneration += 1
     }
 
-    private func updateIdleTimer() {
-        UIApplication.shared.isIdleTimerDisabled = inputEnabled
+    private func savePairing(_ w: Welcome, secret: PairingSecret, peer: MacPeer, host: String?) {
+        if let old = record, old.macID != w.mac { PadKeychain.delete(macID: old.macID) }
+        if !PadKeychain.save(secret, macID: w.mac) {
+            message = "The pairing key could not be saved; you will need to paste it again after a relaunch."
+        }
+        saveRecord(PairingRecord(macID: w.mac, macName: w.name, lastServiceName: peer.name,
+                                 knownGoodHosts: host.map { [$0] } ?? []))
+        // Reconnects go to the newly paired Mac, never to a previous Mac's Bonjour endpoint (the
+        // browser is stopped while connected, so it cannot correct this before the next attempt).
+        pairedEndpoint = peer.endpoint
+        pairedMatchedByID = peer.macID == w.mac
+        pairedAdvertProto = nil
+        pairedSecret = secret
+        pairingText = ""
+        isPaired = true
+        unpairedSheetDismissed = false
+        handle(.paired)
+    }
+
+    private func deletePairing() {
+        if let record { PadKeychain.delete(macID: record.macID) }
+        record = nil
+        UserDefaults.standard.removeObject(forKey: Key.pairing)
+        pairedSecret = nil
+        pairedEndpoint = nil
+        pairedMatchedByID = false
+        pairedAdvertProto = nil
+        isPaired = false
+        unpairedSheetDismissed = false
+        macName = nil
+        if lastGoodbye == .unpaired { message = "Your Mac reset its pairing key. Paste the new key to pair again." }
+    }
+
+    private func saveRecord(_ new: PairingRecord) {
+        record = new
+        if let data = try? JSONEncoder().encode(new) { UserDefaults.standard.set(data, forKey: Key.pairing) }
+    }
+
+    private func setTapOnly(_ codes: Set<UInt16>, for mac: UUID) {
+        tapOnlyMacID = mac
+        if codes != macTapOnlyCodes { macTapOnlyCodes = codes }
+        var stored = Self.storedTapOnly()
+        let list = codes.sorted().map { Int($0) }
+        guard stored[mac.uuidString] != list else { return }
+        stored[mac.uuidString] = list
+        UserDefaults.standard.set(stored, forKey: Key.macTapOnly)
+    }
+
+    // MARK: Timers, heartbeat and ping
+
+    private func updateTimers() {
+        if case .connected = supervisor.state {
+            stop(&tickTimer)
+            if linkTimer == nil { linkTimer = repeating(0.1) { [weak self] in self?.linkTimerFired() } }
+        } else {
+            stop(&linkTimer)
+            if supervisor.nextDeadline == nil {
+                stop(&tickTimer)
+            } else if tickTimer == nil {
+                tickTimer = repeating(0.05) { [weak self] in self?.handle(.tick) }
+            }
+        }
+    }
+
+    private func linkTimerFired() {
+        handle(.tick)
+        guard let stream = liveStream else { return }
+        let time = now
+        // 10% slack absorbs timer jitter against the 100 ms beat.
+        if time - lastHeartbeatAt >= (heldActive ? 0.1 : 1.0) * 0.9 {
+            lastHeartbeatAt = time
+            heartbeatSeq &+= 1
+            let beat = Heartbeat(seq: heartbeatSeq, held: heldKeys.sorted(),
+                                 buttons: heldButtons.sorted { $0.rawValue < $1.rawValue }, active: heldActive)
+            stream.send([.heartbeat(beat, t: Self.micros(time))])
+        }
+        if time - lastPingAt >= 0.9 {
+            lastPingAt = time
+            pingID &+= 1
+            stream.send([.ping(id: pingID, t: Self.micros(time))])
+        }
+    }
+
+    private func repeating(_ interval: TimeInterval, _ body: @escaping () -> Void) -> Timer {
+        let timer = Timer(timeInterval: interval, repeats: true) { _ in body() }
+        timer.tolerance = interval / 10
+        RunLoop.main.add(timer, forMode: .common)
+        return timer
+    }
+
+    private func stop(_ timer: inout Timer?) {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    // MARK: Input mode
+
+    private func inputModeMayHaveChanged() {
+        let mode = deckInputMode
+        guard mode != lastInputMode else { return }
+        if lastInputMode == .live { sendReleaseAll() }
+        lastInputMode = mode
+        UIApplication.shared.isIdleTimerDisabled = mode == .live
+    }
+
+    /// Bypasses the live-mode guard: used when input stops.
+    private func sendReleaseAll() {
+        liveStream?.send([.input(.releaseAll, t: Self.micros(now))])
+    }
+
+    // MARK: Preferences
+
+    private func preferencesChanged(from old: PadPreferences) {
+        guard preferences != old else { return }
+        savePreferences()
+        if preferences.isGeometryChange(from: old) || preferences.protection != old.protection
+            || preferences.showTouchIndicators != old.showTouchIndicators {
+            sendReleaseAll()
+            resetGeneration += 1
+        }
+        if preferences.peerToPeer.useP2P() != old.peerToPeer.useP2P(), browser != nil {
+            startBrowser()
+        }
+        inputModeMayHaveChanged()
+    }
+
+    private func savePreferences() {
+        if let data = try? JSONEncoder().encode(preferences) {
+            UserDefaults.standard.set(data, forKey: PadPreferences.storageKey)
+        }
+    }
+
+    // MARK: Discovery
+
+    private func startBrowser() {
+        stopBrowser()
+        isRefreshing = true
+        discoveryStatus = "Searching for Macs…"
+        let parameters = NWParameters.tcp
+        parameters.includePeerToPeer = preferences.peerToPeer.useP2P()
+        let next = NWBrowser(for: .bonjourWithTXTRecord(type: IKeyService.bonjourType, domain: nil), using: parameters)
+        browser = next
+        next.browseResultsChangedHandler = { [weak self, weak next] results, _ in
+            guard let self, let next, self.browser === next else { return }
+            self.browseResultsChanged(results, browser: next)
+        }
+        next.stateUpdateHandler = { [weak self, weak next] state in
+            guard let self, let next, self.browser === next else { return }
+            switch state {
+            case .failed(let error), .waiting(let error):
+                self.discoveryTimeout?.cancel()
+                self.discoveryTimeout = nil
+                self.isRefreshing = false
+                if case .dns(let code) = error, code == -65570 {
+                    self.discoveryStatus = "Local Network access is blocked. Enable iKey in Settings → Privacy & Security → Local Network, then refresh."
+                } else {
+                    self.discoveryStatus = "Discovery is unavailable. Check Wi-Fi on both devices, then refresh."
+                }
+            case .ready:
+                if self.peers.isEmpty {
+                    self.waitForDiscoveryResults(from: next)
+                } else {
+                    self.showFoundPeers()
+                }
+            default: break
+            }
+        }
+        next.start(queue: .main)
+    }
+
+    private func stopBrowser() {
+        discoveryTimeout?.cancel()
+        discoveryTimeout = nil
+        browser?.stateUpdateHandler = nil
+        browser?.browseResultsChangedHandler = nil
+        browser?.cancel()
+        browser = nil
+        pairedAdvertProto = nil
+        isRefreshing = false
+    }
+
+    private func browseResultsChanged(_ results: Set<NWBrowser.Result>, browser: NWBrowser) {
+        peers = results.compactMap { result -> MacPeer? in
+            guard case let .service(name, _, _, _) = result.endpoint else { return nil }
+            var txt: [String: String] = [:]
+            if case .bonjour(let txtRecord) = result.metadata { txt = txtRecord.dictionary }
+            return MacPeer(id: String(describing: result.endpoint), name: name, endpoint: result.endpoint,
+                           proto: WireV2.peerProtocol(txt: txt),
+                           macID: txt[TXTRecordKeys.macID].flatMap(UUID.init(uuidString:)))
+        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+
+        var paired: MacPeer?
+        if let record {
+            if let byID = peers.first(where: { $0.macID == record.macID }) {
+                paired = byID
+                pairedMatchedByID = true
+                if byID.name != record.lastServiceName {
+                    var renamed = record
+                    renamed.lastServiceName = byID.name
+                    saveRecord(renamed)
+                }
+            } else {
+                paired = peers.first(where: { $0.macID == nil && $0.name == record.lastServiceName })
+                pairedMatchedByID = false
+            }
+        }
+        if let paired { pairedEndpoint = paired.endpoint }
+
+        if !peers.contains(where: { $0.id == selectedPeerID }) {
+            selectedPeerID = paired?.id ?? peers.first(where: { $0.proto >= WireV2.version })?.id ?? peers.first?.id ?? ""
+        }
+        if !peers.isEmpty {
+            showFoundPeers()
+        } else if case .ready = browser.state {
+            waitForDiscoveryResults(from: browser)
+        }
+
+        let proto = paired?.proto
+        if proto != pairedAdvertProto {
+            pairedAdvertProto = proto
+            if let proto { handle(.peerAdvertised(proto: proto)) }
+        }
+    }
+
+    private func showFoundPeers() {
+        discoveryTimeout?.cancel()
+        discoveryTimeout = nil
+        isRefreshing = false
+        discoveryStatus = peers.count == 1 ? "Found 1 Mac." : "Found \(peers.count) Macs."
+    }
+
+    private func waitForDiscoveryResults(from browser: NWBrowser) {
+        discoveryTimeout?.cancel()
+        isRefreshing = true
+        discoveryStatus = "Searching for Macs…"
+        let timeout = DispatchWorkItem { [weak self, weak browser] in
+            guard let self, let browser, self.browser === browser, self.peers.isEmpty else { return }
+            self.isRefreshing = false
+            self.discoveryStatus = "No Macs found yet. On your Mac, start iKey's receiver and wait for Ready. Keep both devices on the same Wi-Fi network."
+            // Keep browsing: a receiver started later should still appear.
+        }
+        discoveryTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: timeout)
+    }
+
+    // MARK: Observers
+
+    private func startObservers() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let satisfied = path.status == .satisfied
+            guard satisfied != self.pathSatisfied else { return }
+            self.pathSatisfied = satisfied
+            self.handle(.pathSatisfied(satisfied))
+        }
+        pathMonitor.start(queue: .main)
+        brightnessObserver = NotificationCenter.default.addObserver(
+            forName: UIScreen.brightnessDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let screen = note.object as? UIScreen else { return }
+            self?.setBrightness(Double(screen.brightness))
+        }
+        // The window scene usually connects only after the model exists.
+        DispatchQueue.main.async { [weak self] in self?.refreshBrightness() }
+    }
+
+    private func refreshBrightness() {
+        let screen = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen }.first
+        if let screen { setBrightness(Double(screen.brightness)) }
+    }
+
+    private func setBrightness(_ brightness: Double) {
+        let low = brightness < Self.glowBrightness
+        if low != lowLight { lowLight = low }
+    }
+
+    // MARK: Helpers
+
+    private var updateNeededMessage: String {
+        lastGoodbye == .protocolMismatch
+            ? "Update iKey on this iPad, then connect again."
+            : "Update iKey on \(macName ?? "your Mac"), then connect again."
+    }
+
+    private static let pairingFailedMessage =
+        "Could not connect. Check the pairing key, Wi-Fi, and that iKey is running on your Mac."
+
+    /// Never traps: non-finite input is 0 and out-of-range values clamp to Int64.
+    private static func micros(_ seconds: Double) -> Int64 {
+        let value = seconds * 1e6
+        guard value.isFinite else { return 0 }
+        if let exact = Int64(exactly: value.rounded(.towardZero)) { return exact }
+        return value < 0 ? .min : .max
+    }
+
+    /// The wire allows at most 64 UTF-8 bytes per string; cut on a character boundary.
+    private static func wireString(_ text: String) -> String {
+        var out = ""
+        var bytes = 0
+        for character in text {
+            let size = String(character).utf8.count
+            guard bytes + size <= 64 else { break }
+            out.append(character)
+            bytes += size
+        }
+        return out
+    }
+
+    private static func loadClientID() -> UUID {
+        let defaults = UserDefaults.standard
+        if let text = defaults.string(forKey: Key.clientID), let id = UUID(uuidString: text) { return id }
+        let id = UUID()
+        defaults.set(id.uuidString, forKey: Key.clientID)
+        return id
+    }
+
+    private static func storedTapOnly() -> [String: [Int]] {
+        UserDefaults.standard.dictionary(forKey: Key.macTapOnly) as? [String: [Int]] ?? [:]
+    }
+
+    private static func storedTapOnly(for mac: UUID) -> Set<UInt16> {
+        Set((storedTapOnly()[mac.uuidString] ?? []).compactMap { UInt16(exactly: $0) })
+    }
+
+    private static func adding(_ host: String, to hosts: [String]) -> [String] {
+        Array(([host] + hosts.filter { $0 != host }).prefix(maxKnownGoodHosts))
+    }
+
+    /// A TLS alert or PSK mismatch, as opposed to an unreachable host.
+    private static func isAuthFailure(_ reason: LinkCloseReason, connection: NWConnection) -> Bool {
+        switch connection.state {
+        case .failed(let error), .waiting(let error):
+            if case .tls = error { return true }
+        default:
+            break
+        }
+        guard case .failed(let text) = reason else { return false }
+        // NWError.tls renders as its Secure Transport status (-98xx).
+        return text.range(of: #"tls|-98\d\d"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+}
+
+/// A pasted key and the Mac it is for; used by the next attempt.
+private struct PendingPairing {
+    let secret: PairingSecret
+    let peer: MacPeer
+}
+
+/// One TCP/TLS attempt and, after the welcome, the session on it.
+private final class LinkAttempt {
+    let stream: PadLinkStream
+    let connection: NWConnection
+    let secret: PairingSecret
+    /// The connection's parameters allowed peer-to-peer (AWDL).
+    let usedP2P: Bool
+    /// Set when this attempt pairs with a pasted key.
+    let pairing: PendingPairing?
+    /// The endpoint came from a Bonjour result advertising the paired Mac's ID.
+    let matchedByID: Bool
+    var helloSentAt: Double?
+    var welcomed = false
+    /// Remote IP without an interface scope, from the latest path.
+    var remoteHost: String?
+
+    init(stream: PadLinkStream, connection: NWConnection, secret: PairingSecret, usedP2P: Bool,
+         pairing: PendingPairing?, matchedByID: Bool) {
+        self.stream = stream; self.connection = connection; self.secret = secret; self.usedP2P = usedP2P
+        self.pairing = pairing; self.matchedByID = matchedByID
+    }
+
+    func note(_ path: NWPath) {
+        if let host = Self.scopedHost(path) {
+            remoteHost = host.split(separator: "%", maxSplits: 1).first.map(String.init) ?? host
+        }
+    }
+
+    /// True when the established path runs over AWDL (peer-to-peer) rather than infrastructure Wi-Fi.
+    static func isPeerToPeer(_ path: NWPath) -> Bool {
+        let awdl = { (name: String) in name.hasPrefix("awdl") || name.hasPrefix("llw") }
+        if let host = scopedHost(path), let scope = host.split(separator: "%").dropFirst().first, awdl(String(scope)) {
+            return true
+        }
+        return path.availableInterfaces.first.map { awdl($0.name) } ?? false
+    }
+
+    private static func scopedHost(_ path: NWPath) -> String? {
+        guard case .hostPort(let host, _)? = path.remoteEndpoint else { return nil }
+        switch host {
+        case .ipv4(let address): return "\(address)"
+        case .ipv6(let address): return "\(address)"
+        case .name(let name, _): return name
+        @unknown default: return "\(host)"
+        }
     }
 }
 
