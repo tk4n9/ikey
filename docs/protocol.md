@@ -58,7 +58,7 @@ to be sent closes the link (`overflow`).
 | `contacts` | `t`, `n` | Fingers counted on the trackpad, 0–10. |
 | `gesture` | `t`, `kind` (`swipe`/`tap`), `fingers`, optional `dir` | Three-finger swipe (`left`, `right`, `up`, `down`) or tap. |
 | `releaseAll` | `t` | Release every key, button and scroll. |
-| `hb` | `t`, `seq`, `held`, `buttons`, `active` | Heartbeat: what the iPad holds. `active` means a contact is on the deck. |
+| `hb` | `t`, `seq`, `held`, `buttons`, `active`, optional `confirm` | Heartbeat: what the iPad holds. `active` means a contact is on the deck. `confirm` is the iPad's key confirmation delay in seconds (0.045 with palm protection on, 0 with it off); the Mac adds it back when it times a Caps Lock press, so the thresholds count from the touch. |
 | `ping` | `t`, `id` | Round-trip probe. |
 | `bye` | `reason` | Goodbye; the link closes after it. |
 
@@ -78,7 +78,22 @@ travel only.
 `prefs` mirrors the Mac's settings (`MacInputPreferences`): `keyRepeatDelay`
 (seconds, or `null` when repeat is off), `keyRepeatInterval`,
 `naturalScrolling`, `trackingIndex`, `fnKeysStandard`, `doubleClickInterval`,
-`threeFingerDrag`, `dragLock`, `tapToClick` and `threeFingerSwipes`.
+`threeFingerDrag`, `dragLock`, `tapToClick`, `threeFingerSwipes` and optional
+`appExposeGesture`.
+
+- `threeFingerSwipes` means the Mac's "Swipe between full-screen applications"
+  swipes at iKey's swipe finger count: four fingers while `threeFingerDrag` is
+  on, otherwise three. The Mac reads its horizontal swipe setting for that
+  count (the vertical one only when the horizontal one is absent). Only "swipe
+  between full-screen applications" counts; "swipe between pages" does not
+  switch Spaces, so it reads as off. Despite the name, it can describe
+  four-finger swipes. While the iPad follows the Mac, it sends swipes and the
+  three-finger Look Up tap only when this is true.
+- `appExposeGesture` is the Mac's App Exposé gesture (Trackpad › More Gestures),
+  which is off on a new Mac. It is true only when that switch is on and the
+  Mac's vertical swipe at iKey's swipe finger count is not off (macOS puts App
+  Exposé on Mission Control's finger count). Absent means off. Only the Mac uses
+  it: a swipe down shows App Exposé only while it is true.
 
 `tapOnly` lists the deck modifier keys that the Mac's key remap turns into
 something other than a modifier, for example `[55]` when left Command is mapped
@@ -117,6 +132,7 @@ decoder drops the link.
   0.015–2.0 s, `trackingIndex` 0–3, `doubleClickInterval` 0.1–5 s. The Mac clamps
   what it reads from its defaults (`MacInputPreferences.clamped()`) before
   sending, so a value set with `defaults write` cannot block the handshake.
+- `confirm` 0–0.25 s.
 - `proto` ≥ 1.
 
 Consecutive `motion` frames, and consecutive `scroll`/`changed` frames, may be
@@ -131,6 +147,11 @@ input and never exceeds the limits above.
 - An unknown `keyboard` value is drawn as ANSI.
 - `prefs` keys that are absent keep their defaults, so either side can add settings.
 - `tapOnly` is encoded only when present, and older iPads ignore it.
+- `confirm` (in `hb`) is encoded only when present. Absent (an older iPad)
+  leaves the Mac's value unchanged (0.045 s until an iPad states one), and older
+  Macs ignore it.
+- `appExposeGesture` (in `prefs`) is optional; absent means off, so an older
+  Mac's `prefs` never turns App Exposé on.
 - An unknown scroll phase or gesture kind is still invalid. Adding one needs a
   new feature name or a protocol bump.
 - `"v"` other than 2 is `unsupportedVersion`. A frame without `"v"` but with
@@ -171,7 +192,7 @@ speaks only v2. It needs a v2 Mac.
 
 | Item | Cadence / limit | Where |
 |---|---|---|
-| Heartbeat `hb` | every 0.1 s while a contact is on the deck, else every 1 s | iPad |
+| Heartbeat `hb` | every 0.1 s while a contact is on the deck or any key or button is held, else every 1 s | iPad |
 | `ping` | about every 1 s while connected | iPad |
 | Round-trip time | p50/p95 of the last 64 pongs, in the settings panel | iPad |
 | Mac silence | link closed when nothing arrives from the Mac for 2.5 s | iPad (`LinkTiming.macSilence`) |
@@ -186,8 +207,10 @@ key or button it holds that the iPad no longer holds. It never presses anything
 and never changes the Caps Lock state. A key remapped to Caps Lock whose up was
 lost is let go without switching the input source.
 
-The 0.1 s heartbeat while touching keeps the 0.25 s repeat lease alive. If Wi-Fi
-stalls, repeat stops within 0.25 s, and held keys are released after 1 s.
+The 0.1 s heartbeat while touching or holding keeps the 0.25 s repeat lease
+alive. A button held with no finger on the deck (drag lock) also beats every
+0.1 s, so the Mac's 1 s dead-man does not drop the drag. If Wi-Fi stalls,
+repeat stops within 0.25 s, and held keys are released after 1 s.
 
 ## Reconnection (iPad)
 
@@ -256,8 +279,14 @@ else was copied in the meantime.
   traffic and later obtains the key can decrypt it. Forward secrecy comes only
   when the ECDHE-PSK suite is negotiated, which is currently off.
 - The Bonjour name and TXT `id` can be spoofed. They only choose whom to try. A
-  spoofed Mac without the key fails TLS. Authentication failures never delete the
-  pairing and count only against a host that handshook before.
+  spoofed Mac without the key fails TLS. When several adverts claim the paired
+  Mac's `id`, the iPad tries the service name remembered from the last
+  successful handshake first, then one advertising `proto` ≥ 2, then the first
+  one (by name); an advert without an `id` is used only when it carries the
+  remembered name. The remembered name changes only after a `welcome`. A stray
+  advert with `proto` 1 or none therefore cannot hold the iPad on **Update iKey
+  on your Mac** while the real Mac is also advertised. Authentication failures
+  never delete the pairing and count only against a host that handshook before.
 - The Mac posts only events from the authenticated active session, and tags each
   one with `eventSourceUserData` 0x694B6579 ("iKey"). It never records local
   typing. The optional Deck check counts event **types** only.

@@ -163,8 +163,8 @@ events bypass. iKey therefore implements it on the Mac. The **Caps Lock** settin
 | Choice | Behaviour |
 |---|---|
 | **Automatic** (default) | **Switches input source** when the Mac's "Use the Caps Lock key to switch to and from ABC" is on and more than one input source is enabled; otherwise **Turns caps lock on**. |
-| **Turns caps lock on** | The real system lock. A press shorter than 75 ms is ignored, like the hardware key. Each change is read back. If the Mac refuses it, iKey falls back to Virtual and the In effect line reads "virtual (permission needed)". |
-| **Switches input source** | A tap shorter than 0.5 s switches to the previous input source (`TISSelectInputSource`; the "Select the previous input source" shortcut only if that fails). A hold of 0.5 s or longer toggles Caps Lock. If the Mac refuses a Caps Lock change, the mode is kept and only the hold is lost: the menu says "Long-press Caps Lock toggle unavailable; input switching still works" until a later change succeeds or you change the setting. |
+| **Turns caps lock on** | The real system lock. A press shorter than 75 ms is ignored, like the hardware key; the time counts from the touch (the iPad's key confirmation delay, sent in its heartbeats, is added back). A tap of a deck modifier remapped to Caps Lock, such as this user's left ⌘, toggles Caps Lock, like the remapped hardware key's ordinary tap: with resting fingers on, the deck sends that tap's down and up together at the lift, so iKey counts it as a full press. Each change is read back. If the Mac refuses it, iKey falls back to Virtual and the In effect line reads "virtual (permission needed)". |
+| **Switches input source** | A tap shorter than 0.5 s switches to the previous input source (by posting the "Select the previous input source" shortcut when it is on; `TISSelectInputSource` only when it is off or unassigned). A hold of 0.5 s or longer toggles Caps Lock. If the Mac refuses a Caps Lock change, the mode is kept and only the hold is lost: the menu says "Long-press Caps Lock toggle unavailable; input switching still works" until a later change succeeds or you change the setting. |
 | **Virtual** | An iKey-only lock carried in the event flags; the system indicator does not change. |
 
 The iPad's Caps Lock LED follows the Mac's state within about 0.1 s (Virtual
@@ -177,9 +177,21 @@ Setting up the remapped left ⌘ as an input switch:
 1. Turn on "Use the Caps Lock key to switch to and from ABC" in System Settings ›
    Keyboard › Text Input › Input Sources › Edit.
 2. Map left ⌘ to Caps Lock (see [key remapping](#key-remapping)).
-3. Leave **Caps Lock** on Automatic. A tap of the drawn left ⌘ then switches
-   between, for example, Korean and English. This is designed to work even with
-   ⌃Space turned off in Keyboard Shortcuts (not yet confirmed on a device).
+3. Keep "Select the previous input source" (⌃Space, on by default) turned on in
+   System Settings › Keyboard › Keyboard Shortcuts › Input Sources.
+4. Leave **Caps Lock** on Automatic. A tap of the drawn left ⌘ then switches
+   between, for example, Korean and English (not yet confirmed on a device).
+
+How iKey switches: while the "Select the previous input source" shortcut is on,
+iKey posts it (lifting any modifiers you hold and pressing them again after), so
+macOS switches the input source of the app you are typing in, Korean 2-Set and
+other CJKV input methods included. Only when the shortcut is off or unassigned
+does iKey select the source itself with `TISSelectInputSource`. From iKey, a
+background app, that can change the menu-bar icon while the focused app keeps
+typing with the old source, and nothing can detect it. When such a switch lands
+on a source that cannot type ASCII (Korean, Chinese, Japanese), the menu shows
+"Korean, Chinese or Japanese input may not switch in the app you type in" with
+where to turn the shortcut on. The line goes away once the shortcut is on.
 
 The **Globe key** setting is described in [top row](top-row.md#globe-fn-key).
 

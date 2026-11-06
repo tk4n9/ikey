@@ -99,6 +99,8 @@ final class DeckTouchView: UIView {
 
     private var engine: DeckInputEngine?
     private var engineKey: EngineKey?
+    /// A typing/trackpad settings change is waiting for the engine to go idle (see `updateEngine`).
+    private var engineRebuildDeferred = false
     private var appliedMode: DeckInputMode = .off
     private var touchIDs: [ObjectIdentifier: Int] = [:]
     private var nextTouchID = 0
@@ -366,8 +368,20 @@ final class DeckTouchView: UIView {
 
     /// Rebuilds the engine whenever anything it depends on changes (the deck geometry covers the model,
     /// placement, preview, iPad override and projection), releasing everything the old one held.
+    /// A change of typing or trackpad settings alone (the Mac's trackpad preferences or tap-only keys
+    /// arrive in a MacState at any moment) waits until the engine is idle: like a MacBook, a setting
+    /// takes effect from the next gesture instead of dropping a held click, drag or drag lock and the
+    /// fingers on the glass.
     private func updateEngine() {
-        guard let key = currentEngineKey(), key != engineKey else { return }
+        guard let key = currentEngineKey(), key != engineKey else {
+            engineRebuildDeferred = false
+            return
+        }
+        if let current = engineKey, key.differsOnlyInSettings(from: current), engineIsBusy {
+            engineRebuildDeferred = true
+            return
+        }
+        engineRebuildDeferred = false
         resetTouches(notify: appliedMode != .off)
         var fresh = DeckInputEngine(deck: key.deck, protection: key.protection, typing: key.typing,
                                     trackpad: key.trackpad, panelTrigger: key.panelTrigger)
@@ -375,6 +389,23 @@ final class DeckTouchView: UIView {
         _ = fresh.drainSignals()
         engine = fresh
         engineKey = key
+    }
+
+    /// Contacts on the glass, keys or buttons held on the Mac (including a drag lock with no finger
+    /// down), or a decision still pending (a tap awaiting its double-tap window, a key awaiting
+    /// confirmation): rebuilding now would drop or release something mid-gesture.
+    private var engineIsBusy: Bool {
+        guard let engine else { return false }
+        return !touchIDs.isEmpty || engine.hasActiveContacts || !engine.heldButtons.isEmpty
+            || !engine.heldKeyCodes.isEmpty || engine.nextDeadline != nil
+    }
+
+    /// Applies a settings-only rebuild that `updateEngine` deferred, once the engine is idle.
+    private func applyDeferredEngineUpdate() {
+        guard engineRebuildDeferred, !engineIsBusy else { return }
+        // Cleared first: the rebuild's own reset runs `refreshAfterInput` again.
+        engineRebuildDeferred = false
+        updateEngine()
     }
 
     /// `.live` runs the engine normally; `.panelOnly` suppresses it (the panel hold still works);
@@ -538,6 +569,7 @@ final class DeckTouchView: UIView {
         updateHoldDisplay()
         reportHeldSnapshot()
         armDeadlineTimer()
+        applyDeferredEngineUpdate()
     }
 
     private func reportHeldSnapshot() {
@@ -1093,6 +1125,12 @@ private struct EngineKey: Equatable {
     var typing: TypingSettings
     var trackpad: TrackpadSettings
     var panelTrigger: PanelTrigger
+
+    /// Only the typing or trackpad settings differ: nothing the deck's touches or geometry depend on.
+    func differsOnlyInSettings(from other: EngineKey) -> Bool {
+        generation == other.generation && deck == other.deck && protection == other.protection
+            && panelTrigger == other.panelTrigger
+    }
 }
 
 private struct HeldSnapshot: Equatable {

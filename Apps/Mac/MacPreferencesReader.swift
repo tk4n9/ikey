@@ -7,11 +7,15 @@ import IOKit
 import SystemConfiguration
 
 /// The built-in trackpad's live IOHID acceleration state. A nil field means it was not readable;
-/// the injector then falls back to HIDCurveTables and the preferences' tracking index.
+/// the injector then falls back to HIDCurveTables, the preferences' tracking index and
+/// ScrollSynthesizer.defaultScrollIndex.
 struct LiveCurves: Equatable {
     var pointer: [HIDAccelCurve]?
     var scroll: [HIDAccelCurve]?
     var trackingIndex: Double?
+    /// The trackpad's scrolling speed as its scroll acceleration index (IOHID
+    /// HIDTrackpadScrollAcceleration, else the global default com.apple.trackpad.scrolling).
+    var scrollIndex: Double?
 }
 
 /// One snapshot of everything the Mac side mirrors. Equatable, so a poll detects any change
@@ -164,6 +168,14 @@ enum MacPreferencesReader {
     // MARK: Live HID curves (medium confidence)
 
     private static func readLiveCurves() -> LiveCurves {
+        var curves = readHIDCurves()
+        // Low confidence: the global default System Settings writes for Scrolling speed, a plain
+        // number on the same scale. Only a gap in the live reading falls back to it.
+        if curves.scrollIndex == nil { curves.scrollIndex = defaultsScrollIndex() }
+        return curves
+    }
+
+    private static func readHIDCurves() -> LiveCurves {
         var iterator: io_iterator_t = 0
         guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOHIDEventService"),
                                            &iterator) == KERN_SUCCESS else { return LiveCurves() }
@@ -177,7 +189,8 @@ enum MacPreferencesReader {
             let curves = LiveCurves(
                 pointer: (hidProperty(service, "HIDAccelCurves") as? [[String: Any]]).flatMap(HIDCurveTables.parse),
                 scroll: (hidProperty(service, "HIDScrollAccelCurves") as? [[String: Any]]).flatMap(HIDCurveTables.parse),
-                trackingIndex: (hidProperty(service, "HIDTrackpadAcceleration") as? NSNumber).flatMap(trackingIndex))
+                trackingIndex: (hidProperty(service, "HIDTrackpadAcceleration") as? NSNumber).flatMap(accelIndex),
+                scrollIndex: (hidProperty(service, "HIDTrackpadScrollAcceleration") as? NSNumber).flatMap(accelIndex))
             // A Magic Trackpad may be attached too; the built-in one is the deck being mirrored.
             if hidProperty(service, "Built-In") as? Bool == true { return curves }
             if fallback == nil { fallback = curves }
@@ -196,11 +209,24 @@ enum MacPreferencesReader {
         return (nested as? [String: Any])?[key]
     }
 
-    /// HIDTrackpadAcceleration is 16.16 fixed point when integral.
-    private static func trackingIndex(_ number: NSNumber) -> Double? {
+    /// HIDTrackpadAcceleration and HIDTrackpadScrollAcceleration are 16.16 fixed point when integral.
+    private static func accelIndex(_ number: NSNumber) -> Double? {
         let value = CFNumberIsFloatType(number as CFNumber) ? number.doubleValue
             : HIDCurveTables.fixedToDouble(number.int64Value)
         return value.isFinite && value >= 0 ? value : nil
+    }
+
+    /// com.apple.trackpad.scrolling in the global domain, when present and a finite non-negative
+    /// number (a `defaults write` may have stored it as a string). InjectorCore range-checks it.
+    private static func defaultsScrollIndex() -> Double? {
+        let parsed: Double?
+        switch UserDefaults.standard.object(forKey: "com.apple.trackpad.scrolling") {
+        case let number as NSNumber: parsed = number.doubleValue
+        case let text as String: parsed = Double(text.trimmingCharacters(in: .whitespaces))
+        default: parsed = nil
+        }
+        guard let value = parsed, value.isFinite, value >= 0 else { return nil }
+        return value
     }
 
     // MARK: Hardware

@@ -156,9 +156,11 @@ settings (`KeyRepeat` and `InitialKeyRepeat`, sent in `prefs`):
 - Only the last key pressed repeats.
 - Among top-row keys, only brightness and volume repeat.
 - Repeats fire only while a frame from the iPad arrived within the last
-  **0.25 s** (`lease`). The iPad sends a heartbeat every 0.1 s while touching,
-  so a Wi-Fi stall stops repeat within 0.25 s instead of typing a run of
-  characters.
+  **0.25 s** (`lease`). The iPad sends a heartbeat every 0.1 s while a contact
+  is on the deck or any key or button is held (every 1 s otherwise), so a Wi-Fi
+  stall stops repeat within 0.25 s instead of typing a run of characters. A
+  drag-locked button with no finger on the deck keeps the 0.1 s beat too, so the
+  Mac's 1 s dead-man does not drop the drag.
 
 ## Where a touch lands
 
@@ -214,7 +216,7 @@ Glass cannot be pressed, so **tap to click is always on**. The Mac's own
 | Resting thumb | A thumb lying in the click zone does nothing: no click and no scroll. A contact there counts as a thumb when it is broad or lands at least 12 mm below a finger. |
 | Palm heels | A broad contact in the click zone within 25 mm of the left or right edge is always ignored. Two broad contacts in the bottom 20 mm at once are a resting hand, and both are ignored. |
 | Right click | Two-finger tap within 0.3 s, both fingers moved < 1.5 mm. |
-| Scroll | Two fingers slide; scrolling starts after 1 mm. |
+| Scroll | Two fingers slide; scrolling starts after 1 mm. A swipe in from the right edge also scrolls (no Notification Center). |
 
 A touch-down never presses the button. Presses come only from lifts, motion or
 deadlines. The old "hold still 0.38 s to drag" is no longer the default. It is
@@ -234,19 +236,48 @@ trackpad again stops the glide, as it does on a MacBook.
 
 ### Three-finger gestures
 
-These run when the Mac has three-finger swipes on.
+Swipes use three fingers, or four while three-finger drag is on (the Mac moves
+its swipes there too). With **Follow Mac** on, they run when the Mac has "Swipe
+between full-screen applications" on at that finger count. "Swipe between
+pages" does not switch Spaces, so a Mac set to it gets no swipes from iKey.
 
 - **Swipe**: at least 18 mm of travel, or a flick of at least 8 mm at 150 mm/s
   or faster.
   - Left / right: switch Space (the Mac's "Move left/right a space" shortcuts).
   - Up: Mission Control.
-  - Down: App Exposé. Down right after a swipe up (within 15 s, with no other
-    input) closes Mission Control instead.
-- **Tap**: within 0.3 s, fingers moved < 2 mm: **Look Up**.
+  - Down: App Exposé, but only when the Mac's own **App Exposé** gesture is on
+    (Trackpad › More Gestures; off on a new Mac) at the same finger count.
+    Otherwise a swipe down does nothing, as on the Mac.
+- **Tap**: three fingers within 0.3 s, moved < 2 mm: **Look Up**.
+
+**Mission Control open state.** iKey cannot read whether Mission Control is
+open, so the Mac app tracks it. A swipe up or the Mission Control key (F3) opens it.
+While it is taken to be open (up to 15 s after it opened):
+
+- pointer motion, scrolling and Spaces swipes keep it open, as when you hover
+  over windows on a MacBook;
+- a swipe down closes it (instead of App Exposé), and another swipe up does
+  nothing, because it is already open (it restarts the 15 s);
+- a key press, a click or a Look Up tap may have closed it (Escape, Return, a
+  click on a window), so the next swipe up opens Mission Control again and the
+  next swipe down is App Exposé (when on);
+- F3 toggles it: pressed while it is taken to be open, it closes it.
+
+While iKey is live, the deck turns off iPadOS's own three-finger editing
+gestures (the undo/redo HUD, the shortcut bar and the copy/paste pinches), so
+they do not appear over the trackpad. This is not yet confirmed on a device.
 
 iKey posts the Mac's own keyboard shortcuts for these actions, read from System
-Settings. A shortcut that is disabled there does nothing. Pinch, rotate, smart
-zoom and the Safari back swipe are not implemented.
+Settings. A shortcut that is disabled there does nothing.
+
+These default MacBook trackpad gestures are not implemented:
+
+- **Notification Center**: a two-finger swipe left from the right edge. iKey
+  has no edge-swipe path, so this motion is an ordinary two-finger scroll and
+  goes to the app under the pointer.
+- **Launchpad** (a pinch with thumb and three fingers) and **Show Desktop**
+  (a spread with thumb and three fingers).
+- Pinch to zoom, rotate, smart zoom and the Safari back swipe.
 
 ### Typing-aware rejection
 

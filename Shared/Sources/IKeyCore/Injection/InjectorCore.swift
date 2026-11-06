@@ -17,13 +17,18 @@ public enum SynthEvent: Equatable, Sendable {
     case scroll(ScrollFrame, flags: ModifierFlags)
     /// IOPMAssertionDeclareUserActivity: iKey input counts as the user being present.
     case declareUserActivity
-    /// Switch to the previously selected keyboard input source, as a Caps Lock tap does with
-    /// 'Use Caps Lock to switch to and from ABC/last used' and as a Globe tap set to 'Change
-    /// Input Source' does. On a real Mac this works whether or not the 'Select the previous
-    /// input source' shortcut (symbolic hot key 60) is enabled, and modifiers the user holds do
-    /// not matter. The poster selects the source itself (TISSelectInputSource between the
-    /// current and the previously selected keyboard source) and posts `fallback` only when it
-    /// cannot; `fallback` is that shortcut's chord, empty when it is disabled or unassigned.
+    /// Switch to the previously selected keyboard input source, as a Caps Lock tap does with 'Use
+    /// Caps Lock to switch to and from ABC/last used' and as a Globe tap set to 'Change Input
+    /// Source' does. On a real Mac this works whether or not the 'Select the previous input source'
+    /// shortcut (symbolic hot key 60) is enabled, and modifiers the user holds do not matter.
+    /// `fallback` is that shortcut's chord (held modifiers lifted and re-pressed around it), empty
+    /// when the shortcut is disabled or unassigned. When it is not empty the poster posts it and
+    /// does nothing else (no TIS call): a posted keystroke switches the frontmost app's input
+    /// context, CJKV input methods such as Korean 2-Set included, which TISSelectInputSource from a
+    /// background agent does not reliably do. Only when `fallback` is empty does the poster select
+    /// the source itself (TISSelectInputSource between the current and the previously selected
+    /// keyboard source). Despite its name, `fallback` is therefore the primary path whenever the
+    /// shortcut is on (amendment L).
     case selectPreviousInputSource(fallback: [SynthEvent])
 }
 
@@ -424,12 +429,14 @@ public struct InjectorCore: Sendable {
         return chord(hotKey.keyCode, mask: hotKey.modifierMask, base: base)
     }
 
-    /// The 'previous input source' shortcut's chord with exactly its own modifiers, for the
-    /// poster to use only when it cannot select the source itself. The switch ignores held
-    /// modifiers, but the shortcut would not: a held Command would turn ^Space into ^⌘Space
-    /// (Emoji & Symbols). So the held modifier keys are lifted first (reverse chord order),
-    /// the chord is posted on the remaining flags (Caps Lock, non-coalesced), and the held keys
-    /// are pressed again in chord order, ending at `held`. Empty when the shortcut is off.
+    /// The 'previous input source' shortcut's chord with exactly its own modifiers. The poster
+    /// posts it (and nothing else) whenever it is not empty and uses TISSelectInputSource only
+    /// when it is empty (shortcut disabled or unassigned); see `SynthEvent.selectPreviousInputSource`.
+    /// The switch ignores held modifiers, but the shortcut would not: a held Command would
+    /// turn ^Space into ^⌘Space (Emoji & Symbols). So the held modifier keys are lifted first
+    /// (reverse chord order), the chord is posted on the remaining flags (Caps Lock,
+    /// non-coalesced), and the held keys are pressed again in chord order, ending at `held`.
+    /// Empty when the shortcut is off.
     private func inputSourceFallback(_ id: Int, held: ModifierFlags) -> [SynthEvent] {
         let heldKeys = Self.heldModifierKeys(held)
         let bare = Self.flags(held, keeping: [])

@@ -41,6 +41,7 @@ Caps Lock mode / Globe action:  (effective modes shown in the Mac menu)
 Top-row strategies:             (from Check Top-Row Keys: function → strategy or 'none')
 Deck check counts:              (only if the iPad lay on the MacBook)
 liveCurves present:             (yes / no / unknown; not shown in the UI yet)
+Scroll speed reading:           (ioreg HIDTrackpadScrollAcceleration / defaults com.apple.trackpad.scrolling)
 RTT p50 / p95 (panel):
 ```
 
@@ -59,8 +60,8 @@ until someone measures it.
 | L1 | Immediate keys touch → post p50 ≤ 55 ms; rest keys lift → post p95 ≤ 25 ms; RTT p95 ≤ 30 ms | [Latency](#l1-latency) | pending |
 | S1 | Cold launch → live ≤ 2 s; Control Center round trip ≤ 0.2 s; Mac wake → live ≤ 5 s; 0 key entries after pairing | [Session](#s1-session-continuity) | pending |
 | S2 | No chrome while live | [Screenshot](#s2-no-chrome) | pending |
-| P1 | 0 accidental drags in 10 min; pointer and scroll within 10% of the real trackpad at 3 speeds; scroll direction matches with natural scrolling on and off | [Trackpad](#p1-trackpad) | pending |
-| K1 | ⌃ arrows, fn arrows, F10–F12, Caps Lock and input-source switching behave as on the MacBook | [Mac keys](#k1-mac-keyboard-semantics) | pending |
+| P1 | 0 accidental drags in 10 min; pointer and scroll within 10% of the real trackpad at 3 speeds and 3 Scrolling speed settings; scroll direction matches with natural scrolling on and off; no iPadOS editing HUD over the trackpad | [Trackpad](#p1-trackpad) | pending |
+| K1 | ⌃ arrows, fn arrows, F10–F12, Caps Lock and input-source switching behave as on the MacBook; after a switch to Korean, Hangul types in the frontmost app with ⌃Space on | [Mac keys](#k1-mac-keyboard-semantics) | pending |
 | M1 | Key-repeat interval jitter < 5 ms after 10 min with no iKey window open (App Nap) | [Repeat jitter](#m1-repeat-jitter) | pending |
 | X1 | The macOS lock-screen password can be typed with iKey | [Lock screen](#x1-lock-screen) | **open question** |
 
@@ -167,7 +168,29 @@ ID for 0.6 s (± 0.05 s), also while disconnected.
   touching the trackpad stops it.
 - Check tap, double-tap, tap-drag, a two-finger tap (right click), thumb tap
   click, thumb tap-hold drag, and three-finger swipes (Spaces both ways, Mission
-  Control open and close, App Exposé) and the three-finger tap (Look Up).
+  Control open and close) and the three-finger tap (Look Up). A swipe down
+  shows App Exposé only with the Mac's App Exposé gesture on (Trackpad › More
+  Gestures); with it off (the default) a swipe down does nothing. Open Mission
+  Control with a swipe up, move the pointer over the windows, then swipe down:
+  it closes. With three-finger drag on, the same swipes use four fingers.
+- Drag lock: start a drag with drag lock on, lift every finger and wait 3 s.
+  The drag must still be held on the Mac (the iPad keeps a 0.1 s heartbeat
+  while a button is held).
+- **iPadOS editing gestures:** while live, three-finger swipes left/right
+  (undo/redo), a three-finger double tap, a three-finger single tap (shortcut
+  bar) and three-finger pinches (copy/paste) on the trackpad must not show the
+  iPadOS undo/redo HUD, the shortcut bar or a copy/paste banner; the Mac still
+  gets the Spaces swipes and Look Up. Repeat after opening and closing the
+  settings panel and after the pairing card was shown. If any appears, the
+  fallback is a hosting-controller subclass.
+- **Scrolling speed:** on the Mac, read
+  `ioreg -r -c IOHIDEventService -l | grep HIDTrackpadScrollAcceleration` (the
+  value iKey uses) and `defaults read -g com.apple.trackpad.scrolling` (its
+  fallback). Change Accessibility › Pointer Control › Trackpad Options ›
+  Scrolling speed from slow to fast: the reading changes, and within about 2 s
+  iKey's scroll distance for the same two-finger stroke changes in the same
+  direction, matching the real trackpad within 10% at slow, default and fast.
+  Record the readings.
 
 ### K1 Mac keyboard semantics
 
@@ -180,10 +203,23 @@ ID for 0.6 s (± 0.05 s), also while disconnected.
 - Caps Lock in the mode you use, and the Mac's indicator matching the iPad LED
   within 150 ms. For the remapped setup: a tap of the drawn **caps lock** key
   sends Escape.
-- Input sources: a tap of the drawn left ⌘ (remapped to Caps Lock) switches
-  between, for example, Korean and English, also with ⌃Space turned off in
-  Keyboard Shortcuts. A long hold does nothing (accepted). A Globe tap does the
-  configured action.
+- Input sources: with Korean 2-Set and ABC enabled, focus TextEdit (or another
+  frontmost app) and tap the drawn left ⌘ (remapped to Caps Lock), then type
+  `gksrmf`. Pass only when **Hangul actually types in the frontmost app**
+  (한글), not when only the menu-bar icon changes; tap again and English types.
+  Do this twice:
+  - with "Select the previous input source" (⌃Space) **on** in Keyboard
+    Shortcuts › Input Sources (iKey posts the shortcut): Hangul must type;
+  - with it **off** (iKey falls back to `TISSelectInputSource`): record whether
+    Hangul types, and check that the Mac menu shows "Korean, Chinese or Japanese
+    input may not switch in the app you type in" after a switch to Korean, and
+    that the line goes away once the shortcut is on again.
+  Also tap left ⌘ while holding ⇧ or right ⌘ with the other hand: the source
+  switches and no Emoji & Symbols viewer opens. A long hold does nothing
+  (accepted). A Globe tap does the configured action; Change input source must
+  pass the same Hangul check.
+- In **Turns caps lock on** mode (Caps Lock set by hand), a tap of the drawn
+  left ⌘ turns Caps Lock on and the next tap turns it off.
 - Holding Delete or E repeats at the Mac's key-repeat speed. Turn Wi-Fi off
   while holding: the repeat stops within 0.25 s and the held key is released
   within 1.1 s.
@@ -266,14 +302,18 @@ These were decided during development and should not be filed as failures:
   - In **Switches input source** mode, only the long-press toggle is lost.
 - Typing heuristics with known residuals are listed in
   [touch behavior](touch-behavior.md#known-residuals-accepted-to-tune-on-a-device).
-- A swipe up while Mission Control is taken to be open (within 15 s, no other
-  input) does nothing.
+- A swipe up while Mission Control is taken to be open (within 15 s of opening,
+  with no key press, click or Look Up tap since) does nothing.
 - The Mac's Tap to click setting is not mirrored: iKey always clicks on tap.
 - US ANSI only; ISO and JIS key shapes are not drawn. No 15-inch Air preset. The
   M1 preset is an estimate.
 - The forward-secret cipher suite is not offered yet (see
   [protocol](protocol.md#threat-model)).
-- Pinch, rotate, smart zoom and the Safari back swipe are not implemented.
+- The Notification Center edge swipe (two fingers left from the right edge)
+  is not implemented: on iKey that motion is an ordinary scroll. The Launchpad
+  pinch and the Show Desktop spread are not implemented either.
+- Pinch to zoom, rotate, smart zoom and the Safari back swipe are not
+  implemented.
 
 ## Results log
 

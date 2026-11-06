@@ -89,9 +89,16 @@ the deck sends a lone fn only when it was tapped within 0.30 s (see
 Globe action:
 
 - **Change input source**: switches to the previously used input source, as a
-  real Globe tap does. The Mac selects the source directly (`TISSelectInputSource`).
-  Only when that fails does it post the "Select the previous input source"
-  shortcut (symbolic hot key 60), lifting any held modifiers around it.
+  real Globe tap does. When the Mac's "Select the previous input source"
+  shortcut (symbolic hot key 60, ⌃Space by default) is on, iKey posts that
+  shortcut, lifting any held modifiers around it and pressing them again after.
+  A posted shortcut switches the input source of the app you are typing in,
+  Korean and other CJKV input methods included. Only when the shortcut is off or
+  unassigned does the Mac select the source directly (`TISSelectInputSource`).
+  From iKey, a background app, that can change the menu-bar icon while the
+  focused app keeps typing with the old source, so after such a switch to a
+  Korean, Chinese or Japanese source the Mac menu asks you to turn the shortcut
+  on.
 - **Emoji & Symbols**: ⌃⌘Space.
 - **Do nothing**.
 

@@ -37,7 +37,8 @@ pending.
   - Thumb tap click, thumb tap-hold drag, resting thumbs and palm-heel
     rejection.
   - Two-finger right click and phased scrolling with momentum.
-  - Three-finger swipes (Spaces, Mission Control, App Exposé) and Look Up.
+  - Three-finger swipes (Spaces, Mission Control, and App Exposé when the Mac
+    has that gesture on) and Look Up, following the Mac's gesture settings.
   - Typing-aware palm rejection.
 - **Mac-side semantics.** Posted events bypass macOS's keyboard and trackpad
   drivers, so the Mac app reproduces what they do:
@@ -192,7 +193,9 @@ project.yml      XcodeGen specification for both apps
 - US ANSI only. The M1 preset is an estimate, and there is no 15-inch Air
   preset. Other iPads get a scaled drawing.
 - Not implemented:
-  - pinch, rotate, smart zoom and the Safari back swipe;
+  - the Notification Center edge swipe (two fingers left from the right edge
+    just scroll), the Launchpad pinch and the Show Desktop spread;
+  - pinch to zoom, rotate, smart zoom and the Safari back swipe;
   - Touch ID and the power key;
   - force click;
   - USB or Bluetooth HID transport;

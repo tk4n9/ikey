@@ -223,6 +223,8 @@ final class PadModel: ObservableObject {
     private static let glowBrightness = 0.3
     /// A close this soon after hello, without a welcome, is how a v1 receiver refuses v2.
     private static let closedAfterHelloWindow = 1.0
+    /// After a Mac's goodbye, an advert that appears this soon may be a stale mDNS cache entry.
+    private static let staleAdvertWindow = 2.0
     private static let goodbyeGrace = 1.0
 
     private var supervisor: ConnectionSupervisor
@@ -244,6 +246,10 @@ final class PadModel: ObservableObject {
     private var pairedEndpoint: NWEndpoint?
     /// TXT proto of the paired Mac's current advert; nil while it is not advertised.
     private var pairedAdvertProto: Int?
+    /// Set by the paired Mac's goodbye(.macSleeping / .receiverStopping): it withdrew its service on
+    /// purpose. Failed attempts say nothing about infrastructure Wi-Fi until its advert comes back
+    /// (see `failureCountsAgainstInfrastructure`) or a welcome arrives.
+    private var macAway: MacAway?
     private let pathMonitor = NWPathMonitor()
     private var pathSatisfied: Bool?
 
@@ -580,7 +586,8 @@ final class PadModel: ObservableObject {
         case .openAttempt:
             openAttempt()
         case .cancelAttempt:
-            if case .tick = input, case .connecting = stateBefore, let attempt {
+            if case .tick = input, case .connecting = stateBefore, let attempt,
+               failureCountsAgainstInfrastructure(attempt) {
                 // Attempt timeout: the transport did not come up on this path.
                 preferences.peerToPeer.attemptFailed(usedP2P: attempt.usedP2P)
             }
@@ -643,7 +650,13 @@ final class PadModel: ObservableObject {
             return
         }
         let usedP2P = preferences.peerToPeer.useP2P()
-        let connection = NWConnection(to: endpoint, using: SecureParameters.make(
+        var target = endpoint
+        if !usedP2P, case .service(let name, let type, let domain, _?) = endpoint {
+            // Discovery may have scoped the advert to its AWDL interface (`browsesPeerToPeer`): an
+            // infrastructure-only attempt resolves the service on any interface it may use instead.
+            target = .service(name: name, type: type, domain: domain, interface: nil)
+        }
+        let connection = NWConnection(to: target, using: SecureParameters.make(
             secret: secret, peerToPeer: usedP2P, offerForwardSecrecy: SecureParameters.offerForwardSecrecyEnabled))
         let stream = PadLinkStream(connection: connection)
         let next = LinkAttempt(stream: stream, connection: connection, secret: secret, usedP2P: usedP2P,
@@ -723,8 +736,11 @@ final class PadModel: ObservableObject {
                 && (host.map { record?.knownGoodHosts.contains($0) ?? false } ?? false)
             let authFailure = Self.isAuthFailure(reason, connection: old.connection)
             // A TLS alert or PSK mismatch proves the path reached the Mac: it is not evidence
-            // against infrastructure Wi-Fi, so it must not push the policy back to P2P.
-            if !authFailure { preferences.peerToPeer.attemptFailed(usedP2P: old.usedP2P) }
+            // against infrastructure Wi-Fi, so it must not push the policy back to P2P. Neither is a
+            // Mac that is asleep, paused, quit or rebooting (not advertised).
+            if !authFailure, failureCountsAgainstInfrastructure(old) {
+                preferences.peerToPeer.attemptFailed(usedP2P: old.usedP2P)
+            }
             if old.pairing != nil { showPairingFailure(Self.pairingFailedMessage) }
             handle(.attemptFailed(authFailure: authFailure, knownGoodHost: knownGood))
         }
@@ -746,7 +762,10 @@ final class PadModel: ObservableObject {
             if p95 != rttP95 { rttP95 = p95 }
         case .goodbye(let reason):
             // A pasted-key Mac's refusal is reported by closed(); it says nothing about the paired Mac.
-            if speaksForStoredPairing(link) { lastGoodbye = reason }
+            if speaksForStoredPairing(link) {
+                lastGoodbye = reason
+                if reason == .macSleeping || reason == .receiverStopping { macAway = MacAway(since: now) }
+            }
         case .unknown:
             break
         }
@@ -760,6 +779,7 @@ final class PadModel: ObservableObject {
         macPrefs = w.prefs
         capsLockOn = w.caps
         lastGoodbye = nil
+        macAway = nil
         // A reconnect of the previously paired Mac keeps a failed pairing's message on screen.
         if link.pairing != nil { pairingFailure = nil }
         message = pairingFailure
@@ -829,6 +849,7 @@ final class PadModel: ObservableObject {
         pairedSecret = nil
         pairedEndpoint = nil
         pairedAdvertProto = nil
+        macAway = nil
         isPaired = false
         macName = nil
         if lastGoodbye == .unpaired { message = "Your Mac reset its pairing key. Paste the new key to pair again." }
@@ -877,7 +898,8 @@ final class PadModel: ObservableObject {
             lastHeartbeatAt = time
             heartbeatSeq &+= 1
             let beat = Heartbeat(seq: heartbeatSeq, held: heldKeys.sorted(),
-                                 buttons: heldButtons.sorted { $0.rawValue < $1.rawValue }, active: heldActive)
+                                 buttons: heldButtons.sorted { $0.rawValue < $1.rawValue }, active: heldActive,
+                                 keyConfirmDelay: DeckInputEngine.keyConfirmationDelay(for: touchProtection))
             stream.send([.heartbeat(beat, t: Self.micros(time))])
         }
         if time - lastPingAt >= 0.9 {
@@ -924,7 +946,7 @@ final class PadModel: ObservableObject {
             sendReleaseAll()
             resetGeneration += 1
         }
-        if preferences.peerToPeer.useP2P() != old.peerToPeer.useP2P(), browser != nil {
+        if Self.browsesPeerToPeer(preferences.peerToPeer) != Self.browsesPeerToPeer(old.peerToPeer), browser != nil {
             startBrowser()
         }
         inputModeMayHaveChanged()
@@ -943,7 +965,7 @@ final class PadModel: ObservableObject {
         isRefreshing = true
         discoveryStatus = "Searching for Macs…"
         let parameters = NWParameters.tcp
-        parameters.includePeerToPeer = preferences.peerToPeer.useP2P()
+        parameters.includePeerToPeer = Self.browsesPeerToPeer(preferences.peerToPeer)
         let next = NWBrowser(for: .bonjourWithTXTRecord(type: IKeyService.bonjourType, domain: nil), using: parameters)
         browser = next
         next.browseResultsChangedHandler = { [weak self, weak next] results, _ in
@@ -1018,11 +1040,42 @@ final class PadModel: ObservableObject {
             waitForDiscoveryResults(from: browser)
         }
 
+        if var away = macAway {
+            if paired == nil {
+                away.sawWithdrawn = true
+                macAway = away
+            } else if pairedAdvertProto == nil, away.sawWithdrawn || now - away.since >= Self.staleAdvertWindow {
+                // The advert came back after the goodbye: the Mac is there again.
+                macAway = nil
+            }
+        }
         let proto = paired?.proto
         if proto != pairedAdvertProto {
             pairedAdvertProto = proto
             if let proto { handle(.peerAdvertised(proto: proto)) }
         }
+    }
+
+    /// Discovery also looks over peer-to-peer (AWDL) unless the setting is Never, whatever the session
+    /// policy: a Mac reachable only over AWDL is then still seen as advertised, so its failures on
+    /// infrastructure Wi-Fi count and Automatic falls back to peer-to-peer. Sessions follow
+    /// `useP2P()`, and the browser stops while connected, so AWDL never runs under a live session
+    /// that infrastructure Wi-Fi carries.
+    private static func browsesPeerToPeer(_ policy: PeerToPeerPolicy) -> Bool {
+        policy.setting != .never
+    }
+
+    /// Whether a failed attempt is evidence against infrastructure Wi-Fi for `PeerToPeerPolicy`.
+    /// Only a failure against a Mac that is advertised now counts: a Mac that is asleep, paused, quit
+    /// or rebooting has withdrawn its Bonjour service, and attempts at it fail on any network, so
+    /// counting them would turn peer-to-peer back on after every Mac sleep. After the paired Mac's
+    /// goodbye(.macSleeping / .receiverStopping) nothing counts until its advert comes back: a browser
+    /// restarted at the goodbye can still report it from the mDNS cache for a moment.
+    private func failureCountsAgainstInfrastructure(_ attempt: LinkAttempt) -> Bool {
+        if let pairing = attempt.pairing {
+            return peers.contains { $0.endpoint == pairing.peer.endpoint }
+        }
+        return pairedAdvertProto != nil && macAway == nil
     }
 
     private func showFoundPeers() {
@@ -1208,6 +1261,14 @@ final class PadModel: ObservableObject {
         // NWError.tls renders as its Secure Transport status (-98xx).
         return text.range(of: #"tls|-98\d\d"#, options: [.regularExpression, .caseInsensitive]) != nil
     }
+}
+
+/// The paired Mac announced it is going away (see `PadModel.macAway`).
+private struct MacAway {
+    /// Uptime of the goodbye.
+    let since: Double
+    /// Discovery has since seen the paired Mac without an advert.
+    var sawWithdrawn = false
 }
 
 /// A pasted key and the Mac it is for; used by the next attempt.

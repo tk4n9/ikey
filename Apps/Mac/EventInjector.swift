@@ -185,6 +185,7 @@ final class EventInjector {
             s.pointerCurves = r.liveCurves.pointer
             s.scrollCurves = r.liveCurves.scroll
             s.trackingIndexOverride = r.liveCurves.trackingIndex
+            s.scrollIndexOverride = r.liveCurves.scrollIndex
             s.scrollBasePtPerMM = r.builtInPtPerMM ?? 5.0
         }
         s.gainScale = gainScale
