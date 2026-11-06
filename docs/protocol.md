@@ -302,8 +302,13 @@ spikes on networks that do not need it. The iPad's **Wi-Fi connection** setting
 - **Automatic** (default): peer-to-peer is allowed until one session over
   ordinary Wi-Fi is confirmed. After that, only ordinary Wi-Fi is used. Three
   consecutive ordinary-Wi-Fi failures allow peer-to-peer again. Authentication
-  failures do not count, because they prove the path reached the Mac.
+  failures do not count, because they prove the path reached the Mac. Failures
+  count only while the paired Mac is advertised: a Mac that is asleep, paused,
+  quit or rebooting (or has just said goodbye) does not push the iPad back to
+  peer-to-peer.
 - **Always allow direct** / **Never direct**.
 
 The Mac listener allows peer-to-peer unless its own setting is **Never direct**.
-The iPad runs no Bonjour browser while connected.
+In Automatic and Always, the iPad's discovery also browses over peer-to-peer
+while it is not connected, so the fallback can find the Mac. The iPad runs no
+Bonjour browser while connected.
