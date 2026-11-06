@@ -50,13 +50,13 @@ final class KeyVisualStateTests: XCTestCase {
     }
 
     func testSecondContactRestingOrRejectedOnPostedKeyKeepsItPressed() {
-        var pipeline = KeyCommitPipeline(settings: TypingSettings(resting: .homeRow))
+        var pipeline = KeyCommitPipeline(settings: TypingSettings(resting: .homeRow, isolatedHold: true))
         var v = KeyVisualState()
         func feed(_ out: [PipelineOutput], _ t: TimeInterval) {
             v.apply(out.compactMap { if case .feedback(let f) = $0 { return f } else { return nil } }, at: t)
         }
         feed(pipeline.land(id: 1, code: 3, at: 0), 0)
-        feed(pipeline.advance(to: 0.25), 0.25)       // isolated hold presses F
+        feed(pipeline.advance(to: 0.30), 0.30)       // isolated hold (opt-in) presses F
         feed(pipeline.land(id: 2, code: 3, at: 0.5), 0.5)
         feed(pipeline.advance(to: 0.9), 0.9)         // the second contact rests
         XCTAssertEqual(pipeline.phase(of: 2), .resting)

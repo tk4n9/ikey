@@ -42,6 +42,8 @@ final class WireV2Tests: XCTestCase {
             .state(MacState()),
             .state(MacState(caps: true)),
             .state(MacState(prefs: prefs, displayAsleep: false)),
+            .state(MacState(caps: false, tapOnly: [55])),
+            .state(MacState(tapOnly: [])),
             .pong(id: UInt32.max, echoT: 1_699_999_999_123_456, macT: -1),
             .goodbye(.protocolMismatch)
         ]
@@ -297,7 +299,9 @@ final class WireV2Tests: XCTestCase {
             ("displayMM zero", welcome(displayMM: [300, 0])),
             ("displayMM NaN", welcome(displayMM: [.nan, 200])),
             ("welcome prefs invalid", welcome(prefs: MacInputPreferences(trackingIndex: 3.5))),
-            ("state prefs invalid", .state(MacState(prefs: MacInputPreferences(keyRepeatInterval: 0))))
+            ("state prefs invalid", .state(MacState(prefs: MacInputPreferences(keyRepeatInterval: 0)))),
+            ("state tapOnly key 300", .state(MacState(tapOnly: [55, 300]))),
+            ("state tapOnly > 32", .state(MacState(tapOnly: Array(repeating: 55, count: 33))))
         ]
         for (rule, message) in macRules {
             assertProtocolError(.invalidEvent, rule) { _ = try WireV2.encode(message) }
@@ -483,6 +487,57 @@ final class WireV2Tests: XCTestCase {
         let valid = MacInputPreferences(keyRepeatDelay: 0.25, keyRepeatInterval: 0.03, naturalScrolling: false,
                                         trackingIndex: 3, tapToClick: false)
         XCTAssertEqual(valid.clamped(), valid)
+    }
+
+    // MARK: MacState.tapOnly (additive field)
+
+    func testStateTapOnlyRoundTripAndEncoding() throws {
+        let state = MacState(caps: true, prefs: MacInputPreferences(naturalScrolling: false), displayAsleep: false,
+                             tapOnly: [55, 61])
+        let data = try WireV2.encode(MacMessage.state(state))
+        XCTAssertEqual(try WireV2.decodeFromMac(data), .state(state))
+        XCTAssertTrue(String(decoding: data, as: UTF8.self).contains(#""tapOnly":[55,61]"#))
+
+        // Encoded only when non-nil; [] (clear) is distinct from nil (unchanged).
+        let without = try XCTUnwrap(try JSONSerialization.jsonObject(
+            with: WireV2.encode(MacMessage.state(MacState(caps: true)))) as? [String: Any])
+        XCTAssertNil(without["tapOnly"])
+        XCTAssertEqual(Set(without.keys), ["v", "m", "caps"])
+        let cleared = try WireV2.encode(MacMessage.state(MacState(tapOnly: [])))
+        XCTAssertEqual(try WireV2.decodeFromMac(cleared), .state(MacState(tapOnly: [])))
+        XCTAssertNotEqual(MacState(tapOnly: []), MacState())
+
+        // The user's remap, computed on the Mac and sent as a state.
+        let remap = KeyRemap.merged(hidutil: [55: 57, 57: 53], modifierKeys: [:], karabiner: [:], manual: nil)
+        let sent = MacState(tapOnly: remap.tapOnlyPadCodes.sorted())
+        XCTAssertEqual(try WireV2.decodeFromMac(WireV2.encode(MacMessage.state(sent))), .state(MacState(tapOnly: [55])))
+
+        // Through the split-capable decoder too.
+        var decoder = MacFrameDecoder()
+        XCTAssertEqual(try decoder.append(data + WireV2.encode(MacMessage.state(MacState(caps: false)))),
+                       [.state(state), .state(MacState(caps: false))])
+    }
+
+    func testStateTapOnlyCompatibility() throws {
+        // An older Mac's state (no tapOnly) decodes with tapOnly nil, i.e. unchanged.
+        let old = #"{"v":2,"m":"state","caps":true,"prefs":{"naturalScrolling":false},"asleep":false}"#
+        XCTAssertEqual(try mac(old), .state(MacState(caps: true, prefs: MacInputPreferences(naturalScrolling: false),
+                                                     displayAsleep: false)))
+        XCTAssertEqual(try mac(#"{"v":2,"m":"state"}"#), .state(MacState()))
+        XCTAssertEqual(try mac(#"{"v":2,"m":"state","tapOnly":null}"#), .state(MacState()))
+        XCTAssertEqual(try mac(#"{"v":2,"m":"state","caps":false,"tapOnly":[55]}"#),
+                       .state(MacState(caps: false, tapOnly: [55])))
+        // Older iPads decode states by key and ignore keys they do not know, the way this build
+        // ignores a later additive field.
+        XCTAssertEqual(try mac(#"{"v":2,"m":"state","caps":true,"tapOnly":[55],"future":{"x":1}}"#),
+                       .state(MacState(caps: true, tapOnly: [55])))
+        // A malformed or out-of-range list is rejected like any other invalid field.
+        for json in [#"{"v":2,"m":"state","tapOnly":[300]}"#, #"{"v":2,"m":"state","tapOnly":[-1]}"#,
+                     #"{"v":2,"m":"state","tapOnly":55}"#, #"{"v":2,"m":"state","tapOnly":["55"]}"#] {
+            assertProtocolError(.invalidEvent, json) { _ = try self.mac(json) }
+        }
+        let maxList = Array(repeating: UInt16(55), count: 32)
+        XCTAssertNoThrow(try WireV2.encode(MacMessage.state(MacState(tapOnly: maxList))))
     }
 
     // MARK: Framing limits and discovery

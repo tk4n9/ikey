@@ -127,9 +127,15 @@ public struct MacState: Codable, Equatable, Sendable {
     public var caps: Bool?
     public var prefs: MacInputPreferences?
     public var displayAsleep: Bool?
+    /// Deck modifier keycodes the Mac's key remap turns into a non-modifier
+    /// (`KeyRemap.tapOnlyPadCodes`, e.g. [55] for left Command → Caps Lock); the iPad types them as
+    /// taps only. [] clears the set; nil leaves it unchanged. Additive field (wire key `tapOnly`):
+    /// encoded only when non-nil, and ignored by older iPads. At most 32 supported key codes.
+    public var tapOnly: [UInt16]?
 
-    public init(caps: Bool? = nil, prefs: MacInputPreferences? = nil, displayAsleep: Bool? = nil) {
-        self.caps = caps; self.prefs = prefs; self.displayAsleep = displayAsleep
+    public init(caps: Bool? = nil, prefs: MacInputPreferences? = nil, displayAsleep: Bool? = nil,
+                tapOnly: [UInt16]? = nil) {
+        self.caps = caps; self.prefs = prefs; self.displayAsleep = displayAsleep; self.tapOnly = tapOnly
     }
 }
 
@@ -440,6 +446,10 @@ private extension MacMessage {
             try w.prefs.validate()
         case .state(let s):
             try s.prefs?.validate()
+            if let tapOnly = s.tapOnly {
+                try WireLimits.check(tapOnly.count <= WireLimits.maxListCount)
+                try tapOnly.forEach(WireLimits.checkKey)
+            }
         case .unknown(let kind):
             try WireLimits.checkString(kind)
         case .pong, .goodbye:
@@ -459,7 +469,7 @@ private enum WireKey: String, CodingKey {
     case kind, fingers, dir
     case seq, held, buttons, active
     case id, reason
-    case mac, name, model, keyboard, displayMM, prefs, caps, asleep
+    case mac, name, model, keyboard, displayMM, prefs, caps, asleep, tapOnly
     case echo, macT
 }
 
@@ -701,7 +711,8 @@ private struct MacFrame: Codable {
         case .state:
             return .state(MacState(caps: try c.decodeIfPresent(Bool.self, forKey: .caps),
                                    prefs: try c.decodeIfPresent(MacInputPreferences.self, forKey: .prefs),
-                                   displayAsleep: try c.decodeIfPresent(Bool.self, forKey: .asleep)))
+                                   displayAsleep: try c.decodeIfPresent(Bool.self, forKey: .asleep),
+                                   tapOnly: try c.decodeIfPresent([UInt16].self, forKey: .tapOnly)))
         case .pong:
             return .pong(id: try c.decode(UInt32.self, forKey: .id),
                          echoT: try c.decode(Int64.self, forKey: .echo),
@@ -733,6 +744,7 @@ private struct MacFrame: Codable {
             try c.encodeIfPresent(s.caps, forKey: .caps)
             try c.encodeIfPresent(s.prefs, forKey: .prefs)
             try c.encodeIfPresent(s.displayAsleep, forKey: .asleep)
+            try c.encodeIfPresent(s.tapOnly, forKey: .tapOnly)
         case .pong(let id, let echoT, let macT):
             try kind(.pong)
             try c.encode(id, forKey: .id)

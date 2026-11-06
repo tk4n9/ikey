@@ -344,6 +344,8 @@ final class KeyPipelineTests: XCTestCase {
         var extended = expected
         extended.revealHeldModifiers = true
         extended.tapOnlyCodes = [55]
+        extended.tapMax = 0.28
+        extended.isolatedHold = true
         let extendedTrip = try JSONDecoder().decode(TypingSettings.self, from: JSONEncoder().encode(extended))
         XCTAssertEqual(extendedTrip, extended)
     }
@@ -353,7 +355,8 @@ final class KeyPipelineTests: XCTestCase {
         XCTAssertEqual(s.resting, .homeRow)
         XCTAssertEqual(s.restThreshold, 0.25)
         XCTAssertEqual(s.spaceRestThreshold, 0.30)
-        XCTAssertTrue(s.isolatedHold)
+        XCTAssertFalse(s.isolatedHold, "isolated hold is opt-in (policy F1)")
+        XCTAssertEqual(s.tapMax, 0.30)
         XCTAssertFalse(s.revealHeldModifiers)
         XCTAssertEqual(s.tapOnlyCodes, [])
         XCTAssertEqual(TypingSettings.homeRowCodes, [0, 1, 2, 3, 38, 40, 37, 41, 49])
@@ -365,13 +368,30 @@ final class KeyPipelineTests: XCTestCase {
         XCTAssertFalse(TypingSettings(resting: .off).isRestCapable(0))
     }
 
-    func testRestThresholdIsClamped() {
-        var p = KeyCommitPipeline(settings: TypingSettings(restThreshold: 0.05, isolatedHold: false))
+    func testTapMaxIsClamped() {
+        var p = KeyCommitPipeline(settings: TypingSettings(tapMax: 0.05))
         _ = p.land(id: 1, code: 38, at: 0)
         XCTAssertEqual(p.nextDeadline ?? 0, 0.15, accuracy: 1e-9)
-        var q = KeyCommitPipeline(settings: TypingSettings(restThreshold: 1.0, isolatedHold: false))
+        var q = KeyCommitPipeline(settings: TypingSettings(tapMax: 1.0))
         _ = q.land(id: 1, code: 38, at: 0)
         XCTAssertEqual(q.nextDeadline ?? 0, 0.35, accuracy: 1e-9)
+        var legacy = KeyCommitPipeline(settings: TypingSettings(restThreshold: 0.15, spaceRestThreshold: 0.2))
+        _ = legacy.land(id: 1, code: 38, at: 0)
+        _ = legacy.land(id: 2, code: 49, at: 0)
+        XCTAssertEqual(legacy.nextDeadline ?? 0, 0.30, accuracy: 1e-9, "legacy thresholds do not move tapMax")
+    }
+
+    func testCommitHeldModifiersPostsOnceAndReleasesAtLift() {
+        var r = PipelineRun(.homeRow)
+        r.land(1, shift, 0)
+        XCTAssertEqual(r.pipeline.commitHeldModifiers(at: 0.5), [.key(code: shift, down: true),
+                                                                 .feedback(.committed(shift))])
+        XCTAssertEqual(r.pipeline.commitHeldModifiers(at: 0.6), [], "already posted")
+        r.land(2, a, 0.7)
+        r.lift(2, 0.75)
+        r.lift(1, 1.0)
+        XCTAssertEqual(r.timed, ["+0@0.750", "-0@0.750", "-56@1.000"])
+        XCTAssertEqual(r.pipeline.postedCodes, [])
     }
 
     /// advance(to: d - 1 ms) never changes anything; advance(to: d) always does and consumes d.
@@ -382,7 +402,7 @@ final class KeyPipelineTests: XCTestCase {
             var rng = SplitMix64(seed: UInt64(seed) &* 7919 &+ 1)
             let mode = modes[rng.below(3)]
             let confirm = rng.chance(0.2) ? 0 : 0.045
-            let settings = TypingSettings(resting: mode, revealHeldModifiers: rng.chance(0.3),
+            let settings = TypingSettings(resting: mode, isolatedHold: rng.chance(0.3),
                                           tapOnlyCodes: rng.chance(0.3) ? [55] : [])
             var p = KeyCommitPipeline(settings: settings, confirmationDelay: confirm)
             var time = 0.0

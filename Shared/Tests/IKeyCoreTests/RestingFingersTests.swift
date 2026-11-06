@@ -54,8 +54,8 @@ final class RestingFingersTests: XCTestCase {
     private let e: UInt16 = 14, t: UInt16 = 17, tab: UInt16 = 48, delete: UInt16 = 51, space: UInt16 = 49
     private let caps: UInt16 = 57, shift: UInt16 = 56, cmd: UInt16 = 55, option: UInt16 = 58
     private let h: UInt16 = 4, q: UInt16 = 12, o: UInt16 = 31
-    /// The opt-in reveal (held modifiers posted 0.30 s after landing) with its stale rule.
-    private let revealing = TypingSettings(resting: .homeRow, revealHeldModifiers: true)
+    /// The opt-in isolated hold (a lone home-row letter held past tapMax presses).
+    private let isolated = TypingSettings(resting: .homeRow, isolatedHold: true)
 
     func testEightHomeRowPlusSpaceRest5sPostsNothing() {
         var r = RestRun()
@@ -82,7 +82,9 @@ final class RestingFingersTests: XCTestCase {
         r.land(1, j, 0)
         r.land(3, 40, 0.01)
         r.land(2, f, 0.5)
-        r.advance(0.75)
+        r.advance(0.79)
+        XCTAssertEqual(r.pipeline.phase(of: 2), .pending, "still a possible tap before tapMax")
+        r.advance(0.80)
         XCTAssertEqual(r.pipeline.phase(of: 2), .resting)
         r.lift(2, 0.8)
         r.lift(1, 1.0)
@@ -205,16 +207,16 @@ final class RestingFingersTests: XCTestCase {
     }
 
     func testIsolatedHoldJPostsDownAtThreshold() {
-        var r = RestRun()
+        var r = RestRun(isolated)
         r.land(1, j, 0)
-        XCTAssertEqual(r.pipeline.nextDeadline ?? 0, 0.25, accuracy: 1e-9)
+        XCTAssertEqual(r.pipeline.nextDeadline ?? 0, 0.30, accuracy: 1e-9)
         r.lift(1, 1.0)
-        XCTAssertEqual(r.timed, ["+38@0.250", "-38@1.000"])
+        XCTAssertEqual(r.timed, ["+38@0.300", "-38@1.000"])
         XCTAssertEqual(r.feedback, [.tentative(j), .committed(j), .released(j)])
     }
 
-    func testIsolatedHoldCanBeTurnedOff() {
-        var r = RestRun(TypingSettings(resting: .homeRow, isolatedHold: false))
+    func testIsolatedHoldIsOffByDefault() {
+        var r = RestRun()
         r.land(1, j, 0)
         r.lift(1, 1.0)
         XCTAssertEqual(r.timed, [])
@@ -235,12 +237,12 @@ final class RestingFingersTests: XCTestCase {
         r.land(2, f, 0.05)
         r.lift(2, 0.1)
         r.lift(1, 1.0)
-        XCTAssertEqual(r.timed, ["+3@0.250", "-3@0.250"],
+        XCTAssertEqual(r.timed, ["+3@0.300", "-3@0.300"],
                        "F waits behind J (I1) until J rests; J was not isolated for its whole life")
     }
 
     func testIsolatedHoldCancelledByForeignContact() {
-        var r = RestRun()
+        var r = RestRun(isolated)
         r.land(1, j, 0)
         r.advance(0.1)
         r.pipeline.noteForeignContact(at: 0.1)
@@ -251,34 +253,34 @@ final class RestingFingersTests: XCTestCase {
     }
 
     func testForeignContactAfterHoldDeadlineDoesNotCancelIt() {
-        var r = RestRun()
+        var r = RestRun(isolated)
         r.land(1, j, 0)
-        r.pipeline.noteForeignContact(at: 0.3)   // delivered before the deadline was advanced
-        r.advance(0.3)
+        r.pipeline.noteForeignContact(at: 0.32)  // delivered before the deadline was advanced
+        r.advance(0.32)
         XCTAssertEqual(r.pipeline.phase(of: 1), .down)
         r.lift(1, 1.0)
-        XCTAssertEqual(r.timed, ["+38@0.250", "-38@1.000"])
+        XCTAssertEqual(r.timed, ["+38@0.300", "-38@1.000"])
     }
 
     func testForeignContactAlreadyDownIsResignalledAfterLanding() {
-        var r = RestRun()
+        var r = RestRun(isolated)
         r.pipeline.noteForeignContact(at: 0)     // a palm or trackpad finger that stays down
         r.land(1, j, 0.1)
         r.pipeline.noteForeignContact(at: 0.1)   // the engine re-signals it after every land
-        r.advance(0.35)
+        r.advance(0.45)
         XCTAssertEqual(r.pipeline.phase(of: 1), .resting)
         r.lift(1, 2.0)
         XCTAssertEqual(r.timed, [])
     }
 
-    func testSlowCmdSPostsChordAtThreshold() {
+    func testSlowCmdSIsARest() {
+        // Policy F1 over F3a: S held past tapMax is a rest, so neither S nor Cmd posts anything.
         var r = RestRun()
         r.land(1, cmd, 0)
         r.land(2, s, 0.6)
         r.lift(2, 0.9)
         r.lift(1, 1.2)
-        XCTAssertEqual(r.timed, ["+55@0.850", "+1@0.850", "-1@0.900", "-55@1.200"],
-                       "Cmd is posted only with the key that commits with it")
+        XCTAssertEqual(r.timed, [], "a rest-capable key held past tapMax never types, even under Cmd")
     }
 
     func testThumbsSettlingOnCmdThenSpaceRestBoth() {
@@ -328,17 +330,18 @@ final class RestingFingersTests: XCTestCase {
         XCTAssertEqual(r.timed, [])
     }
 
-    func testSlowCmdSWithIsolatedHoldOffStillChords() {
-        var r = RestRun(TypingSettings(resting: .homeRow, isolatedHold: false))
+    func testSlowCmdSWithIsolatedHoldOnStillRests() {
+        // Isolated hold needs the key alone on the deck; a held Cmd is another contact.
+        var r = RestRun(isolated)
         r.land(1, cmd, 0)
         r.land(2, s, 0.6)
         r.lift(2, 0.9)
         r.lift(1, 1.2)
-        XCTAssertEqual(r.timed, ["+55@0.850", "+1@0.850", "-1@0.900", "-55@1.200"])
+        XCTAssertEqual(r.timed, [])
     }
 
-    func testIsolatedHoldOffKeyRestsOnceModifierLifted() {
-        var r = RestRun(TypingSettings(resting: .homeRow, isolatedHold: false))
+    func testKeyRestsOnceModifierLifted() {
+        var r = RestRun()
         r.land(1, cmd, 0)
         r.land(2, s, 0.6)
         r.lift(1, 0.7)
@@ -361,7 +364,7 @@ final class RestingFingersTests: XCTestCase {
         XCTAssertEqual(r.pipeline.phase(of: 4), .resting)
         r.advance(6.0)
         XCTAssertEqual(r.pipeline.phase(of: 4), .resting)
-        XCTAssertEqual(r.timed, ["+14@0.310", "-14@0.310", "+4@3.045", "-4@3.080"])
+        XCTAssertEqual(r.timed, ["+14@0.360", "-14@0.360", "+4@3.045", "-4@3.080"])
         XCTAssertFalse(r.pipeline.postedCodes.contains(cmd))
     }
 
@@ -375,16 +378,17 @@ final class RestingFingersTests: XCTestCase {
         r.lift(5, 0.20)
         r.advance(1.0)
         XCTAssertEqual(r.pipeline.phase(of: 2), .resting)
-        XCTAssertEqual(r.timed, ["+14@0.340", "-14@0.340"])
+        XCTAssertEqual(r.timed, ["+14@0.390", "-14@0.390"])
     }
 
-    func testSlowShiftACapitalizes() {
+    func testSlowShiftAIsARest() {
+        // Policy F1: A held 0.30 s (tapMax) rests, so a slow Shift+A types nothing.
         var r = RestRun()
         r.land(1, shift, 0)
         r.land(2, a, 0.4)
         r.lift(2, 0.7)
         r.lift(1, 0.9)
-        XCTAssertEqual(r.timed, ["+56@0.650", "+0@0.650", "-0@0.700", "-56@0.900"])
+        XCTAssertEqual(r.timed, [])
     }
 
     func testModifierLandingAfterKeyBreaksIsolation() {
@@ -393,7 +397,9 @@ final class RestingFingersTests: XCTestCase {
         r.land(2, cmd, 0.1)
         r.advance(0.5)
         XCTAssertEqual(r.pipeline.phase(of: 1), .resting)
-        XCTAssertEqual(r.pipeline.phase(of: 2), .resting, "J rested while Cmd was held unused")
+        // Cmd landed 100 ms after J (the only key then settling): J resting is not Cmd settling,
+        // so Cmd stays held, unposted, and could still chord (tc-hunt-2 finding G).
+        XCTAssertEqual(r.pipeline.phase(of: 2), .pending, "Cmd pressed after J anchored stays live")
         r.lift(1, 0.8)
         r.lift(2, 1.0)
         XCTAssertEqual(r.timed, [])
@@ -433,15 +439,17 @@ final class RestingFingersTests: XCTestCase {
         XCTAssertEqual(r.timed, ["+0@0.100", "-0@0.100", "+14@1.545", "-14@1.550"])
     }
 
-    func testBroadThumbInBurstUsesRestThreshold() {
+    func testBroadThumbInBurstUsesTapMax() {
         var r = RestRun()
         r.land(1, a, 0)
         r.land(2, s, 0.01)
         r.land(3, 45, 0.02, broad: true)
         r.land(4, d, 0.03)
-        r.advance(0.27)
+        r.advance(0.31)
+        XCTAssertEqual(r.pipeline.phase(of: 3), .pending, "burst conversion uses tapMax 0.30 s, not 0.35 s")
+        r.advance(0.32)
         XCTAssertEqual(r.pipeline.phase(of: 3), .resting)
-        r.lift(3, 0.30)
+        r.lift(3, 0.34)
         XCTAssertEqual(r.timed, [])
     }
 
@@ -464,13 +472,16 @@ final class RestingFingersTests: XCTestCase {
         XCTAssertEqual(r.timed, ["+55@3.045", "+48@3.045", "-48@3.100", "-55@3.500"])
     }
 
-    func testRevealedCmdHeld3sThenTabStaysDown() {
-        var r = RestRun(revealing)
+    func testRevealSettingIsIgnoredInRestModes() {
+        // Lazy modifiers: the legacy revealHeldModifiers flag never posts a held modifier.
+        var r = RestRun(TypingSettings(resting: .homeRow, revealHeldModifiers: true))
         r.land(1, cmd, 0)
+        r.advance(2.0)
+        XCTAssertEqual(r.timed, [])
         r.land(2, tab, 3.0)
         r.lift(2, 3.1)
         r.lift(1, 3.5)
-        XCTAssertEqual(r.timed, ["+55@0.300", "+48@3.045", "-48@3.100", "-55@3.500"])
+        XCTAssertEqual(r.timed, ["+55@3.045", "+48@3.045", "-48@3.100", "-55@3.500"])
     }
 
     func testOptionFlushedForPointerStaysDownWhileHandsRest() {
@@ -486,55 +497,46 @@ final class RestingFingersTests: XCTestCase {
         XCTAssertEqual(r.timed, ["+58@1.200", "-58@4.500"])
     }
 
-    func testOptionHeldWithPointerUseStaysDown() {
-        var r = RestRun(revealing)
+    func testOptionCommittedForPointerWithPointerUseStaysDown() {
+        var r = RestRun()
         r.restLeftHand()
         r.land(1, option, 1.0)
-        r.advance(1.5)
-        XCTAssertEqual(r.timed, ["+58@1.300"])
+        r.advance(1.3)
+        XCTAssertEqual(r.timed, [], "never posted from time alone")
+        XCTAssertEqual(r.pipeline.commitHeldModifiers(at: 1.3), [.key(code: option, down: true),
+                                                                 .feedback(.committed(option))])
         r.pipeline.notePointerUse(at: 1.5)
         r.advance(4.0)
-        XCTAssertEqual(r.timed, ["+58@1.300"])
         XCTAssertEqual(r.pipeline.phase(of: 1), .down)
         r.lift(1, 4.5)
-        XCTAssertEqual(r.timed, ["+58@1.300", "-58@4.500"])
-    }
-
-    func testStaleCmdReleasedWhileHandsRest() {
-        var r = RestRun(revealing)
-        r.restLeftHand()
-        r.land(1, cmd, 1.0)
-        r.advance(2.9)
-        XCTAssertEqual(r.timed, ["+55@1.300"])
-        r.advance(3.0)
-        XCTAssertEqual(r.timed, ["+55@1.300", "-55@3.000"])
-        XCTAssertEqual(r.pipeline.phase(of: 1), .resting)
-        r.land(2, e, 3.5)
-        r.lift(2, 3.55)
-        r.lift(1, 4.0)
-        XCTAssertEqual(r.timed, ["+55@1.300", "-55@3.000", "+14@3.545", "-14@3.550"])
+        XCTAssertEqual(r.timed, ["-58@4.500"])
+        XCTAssertEqual(r.pipeline.postedCodes, [])
     }
 
     func testStaleNeedsEnoughRestingContacts() {
-        var r = RestRun(revealing)
+        var r = RestRun()
         r.land(101, a, 0)
         r.land(102, s, 0.01)
         r.land(1, cmd, 1.0)
         r.advance(4.0)
-        XCTAssertEqual(r.timed, ["+55@1.300"])
+        XCTAssertEqual(r.pipeline.phase(of: 1), .pending, "two resting fingers do not make Cmd stale")
+        r.land(2, e, 4.0)
+        r.lift(2, 4.1)
         r.lift(1, 4.5)
-        XCTAssertEqual(r.timed, ["+55@1.300", "-55@4.500"])
+        XCTAssertEqual(r.timed, ["+55@4.045", "+14@4.045", "-14@4.100", "-55@4.500"])
     }
 
-    func testStaleAppliesWhenHandsSettleLater() {
-        var r = RestRun(revealing)
+    func testThumbOnCmdBeforeHandsSettleLaterRestsSilently() {
+        var r = RestRun()
         r.land(1, cmd, 0)
         r.advance(2.5)
-        XCTAssertEqual(r.timed, ["+55@0.300"])
         r.restLeftHand(at: 2.5, firstID: 201)
         r.advance(3.5)
-        XCTAssertEqual(r.timed, ["+55@0.300", "-55@2.780"],
-                       "Released once three fingers rest and the fourth, still undecided, has resolved")
+        XCTAssertEqual(r.pipeline.phase(of: 1), .resting, "a thumb held before the burst settles with it")
+        r.land(2, e, 4.0)
+        r.lift(2, 4.1)
+        r.lift(1, 4.5)
+        XCTAssertEqual(r.timed, ["+14@4.045", "-14@4.100"])
     }
 
     func testCapsInBurstRests() {
@@ -609,7 +611,7 @@ final class RestingFingersTests: XCTestCase {
             r.advance(3.0)
             XCTAssertEqual(r.pipeline.phase(of: 4), .resting)
             for id in [1, 2, 3, 4, 6] { r.lift(id, 3.0) }
-            XCTAssertEqual(r.timed, ["+3@0.290", "-3@0.290", "+4@1.245", "-4@1.260"], "modifier \(mod)")
+            XCTAssertEqual(r.timed, ["+3@0.340", "-3@0.340", "+4@1.245", "-4@1.260"], "modifier \(mod)")
         }
     }
 
@@ -624,7 +626,7 @@ final class RestingFingersTests: XCTestCase {
         r.land(6, h, 1.2)
         r.lift(6, 1.26)
         for id in 1...4 { r.lift(id, 2.0) }
-        XCTAssertEqual(r.timed, ["+14@0.310", "-14@0.310", "+4@1.245", "-4@1.260"])
+        XCTAssertEqual(r.timed, ["+14@0.360", "-14@0.360", "+4@1.245", "-4@1.260"])
     }
 
     func testP6bCmdFirstThenBurstWithTapTypesPlain() {
@@ -638,7 +640,7 @@ final class RestingFingersTests: XCTestCase {
         r.land(6, h, 1.2)
         r.lift(6, 1.26)
         for id in 1...4 { r.lift(id, 2.0) }
-        XCTAssertEqual(r.timed, ["+14@0.310", "-14@0.310", "+4@1.245", "-4@1.260"])
+        XCTAssertEqual(r.timed, ["+14@0.360", "-14@0.360", "+4@1.245", "-4@1.260"])
     }
 
     func testP3LoneCmdHeld5sPostsNothing() {
@@ -759,7 +761,7 @@ final class RestingFingersTests: XCTestCase {
         r.land(3, d, 1.3)                        // the finger returns to D and rests
         r.lift(1, 1.4)
         r.advance(2.0)
-        XCTAssertEqual(r.timed, ["+55@1.195", "+8@1.195", "-8@1.220", "-55@1.550"],
+        XCTAssertEqual(r.timed, ["+55@1.195", "+8@1.195", "-8@1.220", "-55@1.600"],
                        "Cmd up waits until D, landed while Cmd was held, rests (I4)")
     }
 
@@ -839,7 +841,7 @@ final class RestingFingersTests: XCTestCase {
         r.lift(3, 1.20)
         r.lift(2, 1.3)
         r.advance(2.0)
-        XCTAssertEqual(r.timed, ["+56@1.250", "+17@1.250", "-17@1.250", "-56@1.300"],
+        XCTAssertEqual(r.timed, ["+56@1.300", "+17@1.300", "-17@1.300", "-56@1.300"],
                        "T waits behind J (I1); J resting must not rest the Shift T was typed with")
     }
 
@@ -851,7 +853,7 @@ final class RestingFingersTests: XCTestCase {
         r.land(3, c, 1.10)
         r.lift(3, 1.17)
         r.lift(2, 1.3)
-        XCTAssertEqual(r.timed, ["+54@1.250", "+8@1.250", "-8@1.250", "-54@1.300"])
+        XCTAssertEqual(r.timed, ["+54@1.300", "+8@1.300", "-8@1.300", "-54@1.300"])
     }
 
     func testR3CmdCAfterThumbSettlesOnSpaceChords() {
@@ -896,7 +898,7 @@ final class RestingFingersTests: XCTestCase {
         r.land(4, j, 1.14)
         r.lift(4, 1.22)
         r.lift(3, 1.35)
-        XCTAssertEqual(r.timed, ["+60@1.270", "+38@1.270", "-38@1.270", "-60@1.350"])
+        XCTAssertEqual(r.timed, ["+60@1.320", "+38@1.320", "-38@1.320", "-60@1.350"])
     }
 
     func testS1SlowShiftKThatRestedKeepsShiftForTheRetry() {
@@ -964,38 +966,38 @@ final class RestingFingersTests: XCTestCase {
         XCTAssertEqual(r.timed, [])
     }
 
-    // MARK: - Stale rule after use (verifier PV4)
+    // MARK: - A chorded modifier stays down until its contact lifts (policy F3a, verifier PV4)
 
-    func testPV4ModifierSettledAmongRestingHandsStopsChordingAfterStale() {
+    func testPV4ChordedModifierStaysDownUntilItsLift() {
         for mod: UInt16 in [cmd, shift, option, 59, rightCmd] {
             var r = RestRun()
             r.restLeftHand()
             r.land(1, mod, 0.5)
-            tap(&r, 2, h, 1.2)                   // still chords: the accepted ambiguity
-            tap(&r, 3, q, 4.2)
+            tap(&r, 2, h, 1.2)                   // chords: the accepted ambiguity
+            tap(&r, 3, q, 4.2)                   // still chords: F3a has no stale release
             r.advance(6.0)
-            XCTAssertEqual(r.pipeline.phase(of: 1), .resting, "modifier \(mod)")
+            XCTAssertEqual(r.pipeline.phase(of: 1), .down, "modifier \(mod)")
             r.lift(1, 6.0)
-            XCTAssertEqual(r.timed, ["+\(mod)@1.245", "+4@1.245", "-4@1.250", "-\(mod)@3.250",
-                                     "+12@4.245", "-12@4.250"], "modifier \(mod)")
+            XCTAssertEqual(r.timed, ["+\(mod)@1.245", "+4@1.245", "-4@1.250",
+                                     "+12@4.245", "-12@4.250", "-\(mod)@6.000"], "modifier \(mod)")
         }
     }
 
-    func testUsedModifierStaleCountsFromLastKeyActivity() {
+    func testUsedModifierAmongRestingHandsStaysDown() {
         var r = RestRun()
         r.restLeftHand()
         r.land(1, cmd, 0.5)
         tap(&r, 2, h, 1.0)
-        tap(&r, 3, q, 2.5)                       // within 2 s of the last chord: still chords
-        r.land(4, delete, 3.0)                   // held down: never stale while it is held
+        tap(&r, 3, q, 2.5)
+        r.land(4, delete, 3.0)
         r.advance(6.0)
         XCTAssertEqual(r.pipeline.phase(of: 1), .down)
         r.lift(4, 6.0)
-        r.advance(7.9)
+        r.advance(9.0)
         XCTAssertEqual(r.pipeline.phase(of: 1), .down)
-        r.advance(8.0)
+        r.lift(1, 9.5)
         XCTAssertEqual(r.timed, ["+55@1.045", "+4@1.045", "-4@1.050", "+12@2.545", "-12@2.550",
-                                 "+51@3.045", "-51@6.000", "-55@8.000"])
+                                 "+51@3.045", "-51@6.000", "-55@9.500"])
     }
 
     func testUsedModifierWithoutRestingHandsStaysDown() {

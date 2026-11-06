@@ -13,6 +13,29 @@ struct DeckSurface: UIViewRepresentable {
     let showTouchIndicators: Bool
     let onEvent: (InputEvent) -> Void
 
+    // Frozen interface for the drawn true-scale deck (Wave 3 implements it). Appended with defaults so
+    // existing call sites compile unchanged.
+    /// nil = legacy photo/practice path.
+    var drawn: DrawnDeckConfig? = nil
+    /// Fit & Size live preview; overrides `drawn.placement` while non-nil.
+    var previewPlacement: DeckPlacement? = nil
+    /// Effective mode = inputEnabled ? inputMode : .off.
+    var inputMode: DeckInputMode = .live
+    var typing: TypingSettings = .init()
+    var trackpad: TrackpadSettings = .init()
+    var panelTriggerRaw: String = "touchIDHold"
+    var capsLockOn: Bool = false
+    var statusRing: StatusRingStyle = .live
+    var dimmed: Bool = false
+    /// 0...1.
+    var keyboardGlow: Double = 0
+    var onInputs: (([PadInput], TimeInterval) -> Void)? = nil
+    var onRequestPanel: (() -> Void)? = nil
+    /// Held key codes, held buttons, any active contact.
+    var onHeldSnapshot: ((Set<UInt16>, Set<PointerButton>, Bool) -> Void)? = nil
+    var onTouchWhileDisabled: (() -> Void)? = nil
+    var onProjectionResolved: ((ProjectionResolution) -> Void)? = nil
+
     func makeUIView(context: Context) -> DeckTouchView { DeckTouchView() }
 
     func updateUIView(_ view: DeckTouchView, context: Context) {
@@ -20,11 +43,36 @@ struct DeckSurface: UIViewRepresentable {
                        generation: resetGeneration, showRegions: showRegions,
                        selectedKeyID: selectedKeyID, protection: protection,
                        showTouchIndicators: showTouchIndicators, onEvent: onEvent)
+        view.drawn = drawn
+        view.previewPlacement = previewPlacement
+        view.inputMode = inputMode
+        view.typing = typing
+        view.trackpad = trackpad
+        view.panelTriggerRaw = panelTriggerRaw
+        view.capsLockOn = capsLockOn
+        view.statusRing = statusRing
+        view.dimmed = dimmed
+        view.keyboardGlow = keyboardGlow
+        view.onInputs = onInputs
+        view.onRequestPanel = onRequestPanel
+        view.onHeldSnapshot = onHeldSnapshot
+        view.onTouchWhileDisabled = onTouchWhileDisabled
+        view.onProjectionResolved = onProjectionResolved
     }
 
     static func dismantleUIView(_ uiView: DeckTouchView, coordinator: ()) {
         uiView.resetTouches(notify: true)
     }
+}
+
+/// The drawn MacBook deck: model, look and the committed placement.
+struct DrawnDeckConfig: Equatable {
+    var model: MacBookAirModel
+    var finish: DeckFinish
+    var tone: Double
+    var placement: DeckPlacement
+    var iPadOverrideID: String?
+    var pressLook: PressLook
 }
 
 /// Photo painting and hit testing share one aspect-fit rectangle.
@@ -44,6 +92,23 @@ final class DeckTouchView: UIView {
     private var touchIDs: [ObjectIdentifier: Int] = [:]
     private var nextTouchID = 0
     private var tickTimer: Timer?
+
+    // Stored values of the frozen `DeckSurface` interface; not used yet (Wave 3 implements them).
+    var drawn: DrawnDeckConfig?
+    var previewPlacement: DeckPlacement?
+    var inputMode: DeckInputMode = .live
+    var typing = TypingSettings()
+    var trackpad = TrackpadSettings()
+    var panelTriggerRaw = "touchIDHold"
+    var capsLockOn = false
+    var statusRing: StatusRingStyle = .live
+    var dimmed = false
+    var keyboardGlow = 0.0
+    var onInputs: (([PadInput], TimeInterval) -> Void)?
+    var onRequestPanel: (() -> Void)?
+    var onHeldSnapshot: ((Set<UInt16>, Set<PointerButton>, Bool) -> Void)?
+    var onTouchWhileDisabled: (() -> Void)?
+    var onProjectionResolved: ((ProjectionResolution) -> Void)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)

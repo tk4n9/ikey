@@ -1,58 +1,73 @@
 import Foundation
 
-/// Which keys a finger may rest on without typing. Rest-capable keys commit on
-/// lift instead of after the short confirmation delay.
+/// Which keys a finger may rest on without typing. Rest-capable keys (and, in rest modes, every
+/// modifier) type only as a short tap, committed at lift; a longer touch is a rest.
 public enum RestingFingers: String, Codable, CaseIterable, Sendable {
     case off, homeRow, allTypingKeys
 }
 
 /// Typing-feel parameters for `KeyCommitPipeline`. Times are seconds.
+///
+/// Rest-mode policy (plan amendments, section F): a rest-capable key, Space, a modifier or a
+/// tap-only code types only as a TAP, a contact lifted within `tapMax` and `restMaxTravelMM`. A
+/// longer or sliding contact is a REST and posts nothing, ever. Modifiers are lazy: they post only
+/// right before a key that commits while they are held, for pointer output
+/// (`KeyCommitPipeline.commitHeldModifiers(at:)`), or as down+up for a lone tap.
 public struct TypingSettings: Codable, Equatable, Sendable {
     public var resting: RestingFingers
-    /// A rest-capable key held longer than this rests instead of typing (used clamped to 0.15...0.35).
+    /// Legacy (ignored by `KeyCommitPipeline` since the tap policy): the old rest threshold for
+    /// home-row letters. Kept so stored settings and existing call sites still work; `tapMax` is
+    /// the one tap boundary now.
     public var restThreshold: Double
-    /// Rest threshold for Space (thumbs rest there longer before a deliberate tap ends).
+    /// Legacy (ignored): the old rest threshold for Space. `tapMax` applies to Space too.
     public var spaceRestThreshold: Double
-    /// A rest-capable contact that slides farther than this rests.
+    /// A tap that slides farther than this (largest distance from its landing point) is a rest.
+    /// Applies to rest-capable keys, Space, modifiers and tap-only codes.
     public var restMaxTravelMM: Double
-    /// A rest-capable key held alone (nothing else touching) presses at its threshold. Held
-    /// modifiers applying to it do not count as touching. When off, such a key still presses at
-    /// its threshold while an applicable modifier is held (slow Cmd+S). Space never presses this
-    /// way in rest modes: a thumb settling on Space before the hands must not repeat spaces.
-    /// Trade-off kept on purpose: a lone finger resting on a home-row letter (nothing else
-    /// touching) still presses at its threshold, which gives hold-to-repeat and the accent popup.
+    /// Opt-in (default off). On: a home-row letter (not Space, not a modifier) held alone past
+    /// `tapMax`, with no other contact on the deck at any moment since it landed and no foreign
+    /// contact, presses at that deadline (hold-to-repeat, the accent popup) and releases at lift.
+    /// Off: a rest-capable contact held longer than `tapMax` never types.
     public var isolatedHold: Bool
     /// Placement burst: `burstMinContacts` uncommitted contacts, `burstMinRestCapable` of them
-    /// on rest-capable keys, landing within `burstWindow`.
+    /// on rest-capable keys, landing within `burstWindow`; or `burstMinKeys` uncommitted key
+    /// contacts (any keys, not modifiers) landing within `burstWindow`: a hand put down off the
+    /// home row (no tactile bumps on glass). Fast rollover never has that many keys landing that
+    /// close together and all still undecided.
     public var burstWindow: Double
     public var burstMinContacts: Int
     public var burstMinRestCapable: Int
+    public var burstMinKeys: Int
     /// A modifier landing up to this long after a key still applies to it.
     public var chordTolerance: Double
-    /// With `revealHeldModifiers`, a held modifier is posted this long after landing (rest
-    /// modes). It also bounds a lone tap: see `loneModifierTapMax`.
+    /// Legacy (ignored): rest modes never post a held modifier from time alone, and resting
+    /// `.off` posts it after the confirmation delay. Kept for stored settings.
     public var modifierReveal: Double
-    /// A modifier tapped alone (never posted, no partner key) posts down+up at lift when held at
-    /// most max(this, `modifierReveal`); a longer lone press is a resting thumb and posts nothing.
+    /// Legacy (ignored): the old lone-modifier tap limit. Modifiers use `tapMax`.
     public var loneModifierTapMax: Double
-    /// A held modifier rests after this long while `staleRestingContacts` other contacts rest:
-    /// counted from landing when unused (one never posted rests silently, one posted by reveal is
-    /// released), and from its last chord (or later ordinary key activity) once a key committed
-    /// with it, when it is released. Pointer use exempts it.
+    /// A held modifier that has never been posted or used rests silently (never chords) after
+    /// this long while at least `staleRestingContacts` other contacts rest: a thumb lying among
+    /// resting hands. A posted modifier stays down until its contact lifts.
     public var staleModifier: Double
     public var staleRestingContacts: Int
-    /// Rest modes only. Off (default): a held modifier is never posted from time alone, only
-    /// before a key that commits with it, before pointer output (`flushModifiersForPointer`) or
-    /// as a lone tap. On: it is also posted `modifierReveal` after landing (resting thumbs on
-    /// Command or Shift then hold the modifier down until the stale rule or lift).
+    /// Legacy (ignored): rest modes never reveal held modifiers (the lazy-modifier policy).
     public var revealHeldModifiers: Bool
     /// Codes the Mac remaps to a non-modifier, e.g. left Command (55) when the Mac maps it to
-    /// Caps Lock. They never chord, are never revealed, flushed or suspect, and are typed like an
-    /// ordinary key: in rest modes down+up at lift for a tap up to max(`loneModifierTapMax`,
-    /// `modifierReveal`) and nothing for a longer touch, or for any touch made during a placement
-    /// burst or held when one starts (a settling thumb's bounce); with resting off down after the
-    /// confirmation delay and up at lift.
+    /// Caps Lock. They never chord and are never committed for the pointer. In rest modes they type
+    /// down+up at lift for a tap (within `tapMax` and the travel limit) and nothing for a longer
+    /// touch. A tap that overlaps a placement burst (touched in it, held when it starts, or lifted
+    /// while a hand is landing) types only if a key of the burst types (a roll), not if they all
+    /// rest (a settling thumb's bounce), unless it led the burst while typing was in flow and the
+    /// thumb did not settle right after it (the switch tapped while the typing hand returns home).
+    /// A tap of at most 50 ms waits 50 ms and posts nothing when the thumb then lands on it again
+    /// or on Space, Command or Option and stays (a graze on its way to rest); when that contact is
+    /// itself a tap (a typed Space, a quick second switch) both type.
+    /// With resting off: down after the confirmation delay and up at lift.
     public var tapOnlyCodes: Set<UInt16>
+    /// The one tap boundary (rest modes): a rest-capable key, Space, modifier, tap-only code, or a
+    /// non-home key turned lift-committed by a placement burst types only when lifted sooner than
+    /// this after landing. Used clamped to 0.15...0.35.
+    public var tapMax: Double
 
     public init() {
         self.init(resting: .homeRow)
@@ -60,11 +75,12 @@ public struct TypingSettings: Codable, Equatable, Sendable {
 
     public init(resting: RestingFingers = .homeRow, restThreshold: Double = 0.25,
                 spaceRestThreshold: Double = 0.30, restMaxTravelMM: Double = 4.0,
-                isolatedHold: Bool = true, burstWindow: Double = 0.12, burstMinContacts: Int = 3,
-                burstMinRestCapable: Int = 3, chordTolerance: Double = 0.030,
+                isolatedHold: Bool = false, burstWindow: Double = 0.12, burstMinContacts: Int = 3,
+                burstMinRestCapable: Int = 3, burstMinKeys: Int = 4, chordTolerance: Double = 0.030,
                 modifierReveal: Double = 0.30, loneModifierTapMax: Double = 0.25,
                 staleModifier: Double = 2.0, staleRestingContacts: Int = 3,
-                revealHeldModifiers: Bool = false, tapOnlyCodes: Set<UInt16> = []) {
+                revealHeldModifiers: Bool = false, tapOnlyCodes: Set<UInt16> = [],
+                tapMax: Double = 0.30) {
         self.resting = resting
         self.restThreshold = restThreshold
         self.spaceRestThreshold = spaceRestThreshold
@@ -73,6 +89,7 @@ public struct TypingSettings: Codable, Equatable, Sendable {
         self.burstWindow = burstWindow
         self.burstMinContacts = burstMinContacts
         self.burstMinRestCapable = burstMinRestCapable
+        self.burstMinKeys = burstMinKeys
         self.chordTolerance = chordTolerance
         self.modifierReveal = modifierReveal
         self.loneModifierTapMax = loneModifierTapMax
@@ -80,6 +97,7 @@ public struct TypingSettings: Codable, Equatable, Sendable {
         self.staleRestingContacts = staleRestingContacts
         self.revealHeldModifiers = revealHeldModifiers
         self.tapOnlyCodes = tapOnlyCodes
+        self.tapMax = tapMax
     }
 
     /// Missing or unreadable fields keep their defaults, so stored settings survive upgrades.
@@ -97,6 +115,7 @@ public struct TypingSettings: Codable, Equatable, Sendable {
         burstWindow = value(.burstWindow, d.burstWindow)
         burstMinContacts = value(.burstMinContacts, d.burstMinContacts)
         burstMinRestCapable = value(.burstMinRestCapable, d.burstMinRestCapable)
+        burstMinKeys = value(.burstMinKeys, d.burstMinKeys)
         chordTolerance = value(.chordTolerance, d.chordTolerance)
         modifierReveal = value(.modifierReveal, d.modifierReveal)
         loneModifierTapMax = value(.loneModifierTapMax, d.loneModifierTapMax)
@@ -104,6 +123,7 @@ public struct TypingSettings: Codable, Equatable, Sendable {
         staleRestingContacts = value(.staleRestingContacts, d.staleRestingContacts)
         revealHeldModifiers = value(.revealHeldModifiers, d.revealHeldModifiers)
         tapOnlyCodes = value(.tapOnlyCodes, d.tapOnlyCodes)
+        tapMax = value(.tapMax, d.tapMax)
     }
 
     /// A S D F J K L ; and Space.

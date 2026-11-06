@@ -4,7 +4,35 @@ import Foundation
 import IKeyCore
 
 /// Posts only events received from the authenticated iPad. Never monitors local typing.
+///
+/// The public members are a frozen API: ReceiverModel and the menu are written against it.
+/// Today protocol v1 frames run through the legacy path below; v2 messages and the stored
+/// settings take effect once the InjectorCore-based body lands. Main-queue confined.
 final class EventInjector {
+    /// Called when `hasHeldInput` changes.
+    var onHeldInputChanged: ((Bool) -> Void)?
+
+    /// True while any key or mouse button is held down on the Mac.
+    var hasHeldInput: Bool { !heldKeys.isEmpty || leftDown || rightDown }
+
+    /// The system Caps Lock state, falling back to the HID event flags.
+    var capsLockOn: Bool {
+        CapsLockHardware.read() ?? CGEventSource.flagsState(.hidSystemState).contains(.maskAlphaShift)
+    }
+
+    /// The Caps Lock behaviour in effect; the legacy path toggles a virtual lock.
+    var effectiveCapsMode: CapsMode { .virtual }
+
+    private var readings: MacReadings?
+    private var gainScale = 1.0
+    private var scrollSpeedFactor = 1.0
+    private var topRowChoices: [TopRowFunction: TopRowStrategy] = [:]
+    /// nil: follow the Mac's settings.
+    private var capsModePreference: CapsMode?
+    /// nil: follow the Mac's settings.
+    private var fnTapPreference: FnTapAction?
+    private var reportedHeldInput = false
+
     private let source = CGEventSource(stateID: .privateState)
     private var heldKeys: Set<UInt16> = []
     private var capsLockEnabled = false
@@ -33,7 +61,39 @@ final class EventInjector {
         }
     }
 
+    func handle(_ message: PadMessage) {
+        if case .legacy(let event) = message { handle(event) }
+    }
+
+    func apply(readings: MacReadings) {
+        self.readings = readings
+    }
+
+    func setTuning(gainScale: Double, scrollSpeedFactor: Double) {
+        self.gainScale = gainScale
+        self.scrollSpeedFactor = scrollSpeedFactor
+    }
+
+    func setTopRowChoices(_ choices: [TopRowFunction: TopRowStrategy]) {
+        topRowChoices = choices
+    }
+
+    /// nil = automatic from the readings.
+    func setCapsModePreference(_ mode: CapsMode?) {
+        capsModePreference = mode
+    }
+
+    /// nil = automatic from the readings.
+    func setFnTapPreference(_ action: FnTapAction?) {
+        fnTapPreference = action
+    }
+
+    /// Posts one top-row function with the given strategy (the menu's self-test). The legacy
+    /// path has no top-row strategies, so this posts nothing until the v2 body lands.
+    func postTopRowTest(_ f: TopRowFunction, strategy: TopRowStrategy) {}
+
     func handle(_ event: InputEvent) {
+        defer { reportHeldInput() }
         // Keep the input sink defensive even if called outside the wire decoder.
         guard (try? event.validate()) != nil else { return }
         switch event {
@@ -71,6 +131,14 @@ final class EventInjector {
         rightDown = false
         scrollRemainder = .zero
         clicks.removeAll()
+        reportHeldInput()
+    }
+
+    private func reportHeldInput() {
+        let held = hasHeldInput
+        guard held != reportedHeldInput else { return }
+        reportedHeldInput = held
+        onHeldInputChanged?(held)
     }
 
     private func postKey(code: UInt16, down: Bool) {
