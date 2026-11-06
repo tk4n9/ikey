@@ -30,17 +30,23 @@ final class EventInjector {
     /// mode; `.switchesInputSource` is kept, see `setCapsLock`).
     var effectiveCapsMode: CapsMode { settings.capsMode }
 
-    /// Additive (amendments C/H): the Mac's own key remapping that v2 input mirrors, read from
-    /// hidutil, the Modifier Keys preferences and Karabiner-Elements. Empty until the first read.
+    /// Additive (amendments C/H/J): the effective key remapping that v2 input mirrors: the Mac's
+    /// detected remap (hidutil, the Modifier Keys preferences, Karabiner-Elements) merged with the
+    /// manual pairs, or empty while applying is off (`setKeyRemapOverride`).
     private(set) var keyRemap = KeyRemap()
-    /// Additive: called on the main queue when `keyRemap` changes (e.g. to send MacState.tapOnly).
+    /// Additive: the detected remap without manual pairs, also while applying is off (for display).
+    private(set) var detectedKeyRemap = KeyRemap()
+    /// Additive (amendment J): true once the first remap read has finished, even if it found nothing.
+    private(set) var hasReadKeyRemap = false
+    /// Additive: called on the main queue whenever `keyRemap` or `detectedKeyRemap` changes
+    /// (also for `setKeyRemapOverride` changes before the first read, e.g. while not listening),
+    /// and once when the first remap read finishes even if nothing changed. A consumer that must
+    /// not act on a partial remap (the first MacState.tapOnly, amendment H) checks
+    /// `hasReadKeyRemap` in the callback.
     var onKeyRemapChanged: ((KeyRemap) -> Void)?
 
     /// Every posted event carries this in kCGEventSourceUserData ("iKey").
     private static let userData: Int64 = 0x694B6579
-    /// The remap is re-read this often (a repeating timer, independent of input) and at most
-    /// this often on v2 input.
-    private static let remapRefreshInterval: TimeInterval = 2.0
     private static let log = Logger(subsystem: "com.ikey.mac", category: "injector")
 
     private let legacy = LegacyEventInjector()
@@ -68,22 +74,18 @@ final class EventInjector {
 
     private var userActivityAssertion = IOPMAssertionID(0)
     private var remapReadInFlight = false
-    private var lastRemapRead: TimeInterval = -.infinity
     /// The last successfully read pairs of each remap layer; a layer whose read fails keeps
-    /// these, so one failed or slow read never drops the user's remap.
+    /// these, so one failed or slow read never drops the user's remap. An override change
+    /// re-merges these without re-reading.
     private var remapLayers = KeyRemapReader.Layers()
-    private var remapTimer: DispatchSourceTimer?
     /// The layers whose last read failed (logged only when this changes).
     private var lastRemapFailures: [String] = []
-
-    init() {
-        refreshKeyRemap(at: Self.now)
-        startRemapTimer()
-    }
+    /// `setKeyRemapOverride`: false applies no remap at all.
+    private var applyDetectedRemap = true
+    private var manualRemap: [UInt16: UInt16]?
 
     deinit {
         timer?.cancel()
-        remapTimer?.cancel()
         if userActivityAssertion != 0 { IOPMAssertionRelease(userActivityAssertion) }
     }
 
@@ -100,9 +102,7 @@ final class EventInjector {
             handle(event)
             return
         }
-        let now = Self.now
-        if case .input = message, now - lastRemapRead >= Self.remapRefreshInterval { refreshKeyRemap(at: now) }
-        post(core.handle(message, at: now, env: environment()))
+        post(core.handle(message, at: Self.now, env: environment()))
         didCallCore()
     }
 
@@ -112,10 +112,12 @@ final class EventInjector {
         didCallCore()
     }
 
+    /// Also the only remap-read trigger (amendment J): ReceiverModel calls this at start and on
+    /// each preferences poll while listening.
     func apply(readings: MacReadings) {
         self.readings = readings
         rebuildSettings()
-        refreshKeyRemap(at: Self.now)
+        refreshKeyRemap()
     }
 
     func setTuning(gainScale: Double, scrollSpeedFactor: Double) {
@@ -373,24 +375,20 @@ final class EventInjector {
 
     // MARK: - Key remap
 
-    /// Re-reads the remap every `remapRefreshInterval` whether or not input arrives (amendment
-    /// C: "on each preferences poll"), so a remap changed while iKey is idle is applied, and the
-    /// iPad's tap-only keys updated, before the next keystroke.
-    private func startRemapTimer() {
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.setEventHandler { [weak self] in self?.refreshKeyRemap(at: EventInjector.now) }
-        timer.schedule(deadline: .now() + Self.remapRefreshInterval, repeating: Self.remapRefreshInterval,
-                       leeway: .milliseconds(250))
-        timer.resume()
-        remapTimer = timer
+    /// Additive (amendment J): `apply` false posts every key unmapped (effective map [:]);
+    /// otherwise the detected layers merged with `manual` via `KeyRemap.merged`. Takes effect
+    /// immediately from the last read layers, without re-reading.
+    func setKeyRemapOverride(apply: Bool, manual: [UInt16: UInt16]?) {
+        applyDetectedRemap = apply
+        manualRemap = manual
+        updateKeyRemap(reportAnyway: false)
     }
 
-    /// Reads the remap off the main queue (hidutil runs as a child process with a timeout)
-    /// and applies it when it changed. Layers whose read fails keep their last good pairs.
-    private func refreshKeyRemap(at now: TimeInterval) {
+    /// Reads the remap off the main queue (hidutil runs as a child process with a timeout).
+    /// At most one read runs at a time; a request during a read is dropped.
+    private func refreshKeyRemap() {
         guard !remapReadInFlight else { return }
         remapReadInFlight = true
-        lastRemapRead = now
         let lastGood = remapLayers
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let result = KeyRemapReader.read(lastGood: lastGood)
@@ -398,6 +396,7 @@ final class EventInjector {
         }
     }
 
+    /// Layers whose read failed keep their last good pairs.
     private func keyRemapRead(_ result: KeyRemapReader.ReadResult) {
         remapReadInFlight = false
         remapLayers = result.layers
@@ -410,14 +409,36 @@ final class EventInjector {
                 Self.log.error("Key remap read failed for [\(failed, privacy: .public)]; keeping their last read pairs")
             }
         }
-        let remap = result.remap
-        guard remap != keyRemap else { return }
-        keyRemap = remap
+        let firstRead = !hasReadKeyRemap
+        hasReadKeyRemap = true
+        updateKeyRemap(reportAnyway: firstRead)
+    }
+
+    /// Recomputes the detected and effective remaps from the stored layers and the override,
+    /// rebuilds the settings when the effective one changed and reports any change
+    /// (`reportAnyway`: the first read itself, which reports even when nothing changed).
+    private func updateKeyRemap(reportAnyway: Bool) {
+        let detected = remapLayers.merged(manual: nil)
+        let effective = applyDetectedRemap ? remapLayers.merged(manual: manualRemap) : KeyRemap()
+        var changed = false
+        if detected != detectedKeyRemap {
+            detectedKeyRemap = detected
+            changed = true
+            Self.log.notice("Detected key remap \(Self.describe(detected), privacy: .public)")
+        }
+        if effective != keyRemap {
+            keyRemap = effective
+            changed = true
+            Self.log.notice("Applied key remap \(Self.describe(effective), privacy: .public)")
+            rebuildSettings()
+        }
+        if changed || reportAnyway { onKeyRemapChanged?(keyRemap) }
+    }
+
+    private static func describe(_ remap: KeyRemap) -> String {
         let pairs = remap.map.sorted { $0.key < $1.key }.map { "\($0.key)→\($0.value)" }.joined(separator: ", ")
         let sources = remap.sources.map(\.rawValue).joined(separator: ", ")
-        Self.log.notice("Key remap [\(pairs, privacy: .public)] from [\(sources, privacy: .public)]")
-        rebuildSettings()
-        onKeyRemapChanged?(remap)
+        return "[\(pairs)] from [\(sources)]"
     }
 }
 
@@ -542,10 +563,13 @@ private enum KeyRemapReader {
         var hidutil: [UInt16: UInt16] = [:]
         var modifierKeys: [UInt16: UInt16] = [:]
         var karabiner: [UInt16: UInt16] = [:]
+
+        func merged(manual: [UInt16: UInt16]?) -> KeyRemap {
+            KeyRemap.merged(hidutil: hidutil, modifierKeys: modifierKeys, karabiner: karabiner, manual: manual)
+        }
     }
 
     struct ReadResult {
-        var remap: KeyRemap
         /// `lastGood` with every successfully read layer replaced.
         var layers: Layers
         /// Names of the layers whose read failed (they kept their `lastGood` pairs).
@@ -562,9 +586,7 @@ private enum KeyRemapReader {
         if let pairs = hidutil() { layers.hidutil = pairs } else { failed.append(KeyRemapSource.hidutil.rawValue) }
         if let pairs = modifierKeys() { layers.modifierKeys = pairs } else { failed.append(KeyRemapSource.modifierKeys.rawValue) }
         if let pairs = karabiner() { layers.karabiner = pairs } else { failed.append(KeyRemapSource.karabiner.rawValue) }
-        let remap = KeyRemap.merged(hidutil: layers.hidutil, modifierKeys: layers.modifierKeys,
-                                    karabiner: layers.karabiner, manual: nil)
-        return ReadResult(remap: remap, layers: layers, failed: failed)
+        return ReadResult(layers: layers, failed: failed)
     }
 
     /// `hidutil property --get UserKeyMapping`; nil when it cannot run, times out or fails.

@@ -41,6 +41,8 @@ final class ReceiverModel: ObservableObject {
     @Published var launchAtLogin: Bool {
         didSet { if !syncingLoginItem && launchAtLogin != oldValue { applyLoginItem() } }
     }
+    /// Open at login is registered but waits for the user's approval in System Settings.
+    @Published private(set) var loginItemNeedsApproval: Bool
     /// Pointer fine-tune on top of the Mac's tracking speed (0.75...1.25).
     @Published var gainScale: Double {
         didSet { defaults.set(gainScale, forKey: Keys.gainScale); applyTuning() }
@@ -55,6 +57,7 @@ final class ReceiverModel: ObservableObject {
             defaults.set(capsModePreference?.rawValue, forKey: Keys.capsMode)
             injector.setCapsModePreference(capsModePreference)
             refreshCapsMode()
+            refreshCapsHardware()
         }
     }
     /// nil follows the Mac's settings.
@@ -66,8 +69,13 @@ final class ReceiverModel: ObservableObject {
     }
     @Published private(set) var connectedDeviceName: String? = nil
     @Published private(set) var capsMode: CapsMode
+    /// In 'Switches input source' mode: the system Caps Lock cannot be reached, so a long press
+    /// cannot toggle it (taps still switch the input source; amendment J).
+    @Published private(set) var capsHardwareUnavailable = false
     @Published private(set) var keychainProblem: String? = nil
     @Published private(set) var trackingIndexShown: Double
+    /// "Use F1, F2, etc. keys as standard function keys" on this Mac (fnState).
+    @Published private(set) var fnKeysStandard: Bool
     /// An iPad has connected with the current key.
     @Published private(set) var isPaired: Bool {
         didSet { defaults.set(isPaired, forKey: Keys.paired) }
@@ -75,8 +83,37 @@ final class ReceiverModel: ObservableObject {
     /// pairAnotherIPad() was chosen and no new iPad has connected since: the UI shows Copy/Show.
     @Published private(set) var isPairingAnother = false
 
-    /// The Mac's key remap that v2 input mirrors (read by the injector).
+    /// The key remap v2 input mirrors: the Mac's detected layers plus the manual pairs, or empty
+    /// while `applyKeyRemap` is off (the injector's effective remap).
     @Published private(set) var keyRemap = KeyRemap()
+    /// The Mac's own remapping layers as detected, without manual pairs, also while
+    /// `applyKeyRemap` is off.
+    @Published private(set) var detectedKeyRemap = KeyRemap()
+    /// The injector has finished its first remap read (`keyRemap` reflects the Mac).
+    @Published private(set) var hasReadKeyRemap = false
+    /// Mirror the Mac's key remapping (hidutil, Modifier Keys, Karabiner) and the manual pairs.
+    @Published var applyKeyRemap: Bool {
+        didSet {
+            guard applyKeyRemap != oldValue else { return }
+            defaults.set(applyKeyRemap, forKey: Keys.applyKeyRemap)
+            applyKeyRemapOverride()
+        }
+    }
+    /// Extra source → target keycode pairs (target `KeyRemap.noAction` disables the key; a key
+    /// mapped to itself cancels a detected remap). Edited with set/removeManualRemap.
+    @Published private(set) var manualKeyRemap: [UInt16: UInt16]
+
+    /// The top-row strategies confirmed in 'Check Top-Row Keys' (persisted; a function without a
+    /// choice uses its default chain).
+    @Published var topRowChoices: TopRowChoices {
+        didSet {
+            guard topRowChoices != oldValue else { return }
+            if let data = try? JSONEncoder().encode(topRowChoices) {
+                defaults.set(data, forKey: TopRowChoices.storageKey)
+            }
+            injector.setTopRowChoices(topRowChoices.strategies())
+        }
+    }
 
     var pairingKey: String { secret?.hex ?? "" }
 
@@ -91,10 +128,38 @@ final class ReceiverModel: ObservableObject {
         static let capsMode = "iKey.capsModePreference"
         static let fnTap = "iKey.fnTapPreference"
         static let paired = "iKey.paired"
+        static let applyKeyRemap = "iKey.keyRemap.apply"
+        static let manualKeyRemap = "iKey.keyRemap.manual"
     }
 
-    private static let droppedNotice = "iPad disconnected. Waiting for it to reconnect."
-    private static let pairAnotherNotice = "Copy the pairing key and paste it in iKey on the other iPad."
+    /// A transient status line, shown after the connected line while an iPad is connected.
+    private enum Notice: Equatable {
+        case dropped
+        case pairAnother
+        case pairingHint(host: String)
+        case keyRotationFailed(OSStatus)
+
+        var text: String {
+            switch self {
+            case .dropped: return "iPad disconnected. Waiting for it to reconnect."
+            case .pairAnother: return "Copy the pairing key and paste it in iKey on the other iPad."
+            case .pairingHint(let host):
+                return "An iPad at \(host) could not connect. Paste this Mac's pairing key in iKey on that iPad."
+            case .keyRotationFailed(let code):
+                return "Could not save a new pairing key (error \(code)). The current key stays in effect."
+            }
+        }
+
+        /// Hints that also clear by themselves after `noticeLifetime` (amendment J).
+        var expires: Bool {
+            switch self {
+            case .pairingHint, .keyRotationFailed: return true
+            case .dropped, .pairAnother: return false
+            }
+        }
+    }
+
+    private static let noticeLifetime: TimeInterval = 30
     private static let permissionText =
         "Allow iKey in System Settings → Privacy & Security → Accessibility, then choose Check Again."
     private static let log = Logger(subsystem: "com.ikey.mac", category: "receiver")
@@ -122,9 +187,11 @@ final class ReceiverModel: ObservableObject {
     private var sessions: [UUID: Session] = [:]
     /// True while this side ends sessions on purpose (pause, sleep, new key, disconnect).
     private var endingDeliberately = false
-    /// Transient status line (drop, pairing hint, pair-another or key-rotation result); shown
-    /// after the connected line while an iPad is connected. Cleared when a new iPad connects.
-    private var notice: String?
+    /// Cleared when it is acted on or a session goes live; hints also expire.
+    private var notice: Notice? {
+        didSet { scheduleNoticeExpiry() }
+    }
+    private var noticeExpiryWork: DispatchWorkItem?
     /// The iPad that was connected when pairAnotherIPad() was chosen: its reconnecting does not
     /// end pairing-another (only a different iPad does).
     private var pairingAnotherExcludedClient: UUID?
@@ -149,13 +216,12 @@ final class ReceiverModel: ObservableObject {
     private var clearPasteboardWork: DispatchWorkItem?
     private var syncingLoginItem = false
 
-    /// Sorted deck codes the iPad must type as taps only (from the injector's remap). nil until
-    /// the first remap read has settled, so MacState leaves the iPad's persisted set unchanged
-    /// instead of clearing it (amendment H).
+    /// Sorted deck codes the iPad must type as taps only (from the effective remap). nil until
+    /// the remap is known, so MacState leaves the iPad's persisted set unchanged instead of
+    /// clearing it (amendment H).
     private var tapOnlyCodes: [UInt16]?
-    /// The injector's first remap read runs off-main (hidutil has a 2 s timeout); after this the
-    /// current remap counts as read even when it is empty (no change callback fires then).
-    private static let remapSettleDelay: TimeInterval = 3
+    /// The effective remap map the last tap-only codes were computed from.
+    private var mirroredRemapMap: [UInt16: UInt16]?
 
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
 
@@ -166,25 +232,31 @@ final class ReceiverModel: ObservableObject {
         trackingIndexShown = readings.liveCurves.trackingIndex ?? readings.prefs.trackingIndex
         let defaults = UserDefaults.standard
         peerToPeer = defaults.string(forKey: Keys.peerToPeer).flatMap(PeerToPeerSetting.init(rawValue:)) ?? .automatic
-        launchAtLogin = Self.loginItemEnabled(SMAppService.mainApp.status)
+        let loginStatus = SMAppService.mainApp.status
+        launchAtLogin = Self.loginItemEnabled(loginStatus)
+        loginItemNeedsApproval = loginStatus == .requiresApproval
+        fnKeysStandard = readings.prefs.fnKeysStandard
         gainScale = defaults.object(forKey: Keys.gainScale) as? Double ?? 1
         scrollSpeedFactor = defaults.object(forKey: Keys.scrollSpeedFactor) as? Double ?? 1
         capsModePreference = defaults.string(forKey: Keys.capsMode).flatMap(CapsMode.init(rawValue:))
         fnTapPreference = defaults.string(forKey: Keys.fnTap).flatMap(FnTapAction.init(rawValue:))
         isPaired = defaults.bool(forKey: Keys.paired)
         capsMode = .system
+        applyKeyRemap = defaults.object(forKey: Keys.applyKeyRemap) as? Bool ?? true
+        manualKeyRemap = Self.decodeManualRemap(defaults.dictionary(forKey: Keys.manualKeyRemap))
+        topRowChoices = defaults.data(forKey: TopRowChoices.storageKey)
+            .flatMap { try? JSONDecoder().decode(TopRowChoices.self, from: $0) } ?? TopRowChoices()
 
         injector.onHeldInputChanged = { [weak self] held in self?.drive(.heldInputChanged(held)) }
+        // Fires after the first remap read (also when it finds nothing) and on every change of
+        // the effective remap; the readings themselves come only from pollPreferences while
+        // listening (amendment J).
         injector.onKeyRemapChanged = { [weak self] _ in self?.keyRemapChanged() }
-        if injector.keyRemap != KeyRemap() { keyRemapChanged() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.remapSettleDelay) { [weak self] in
-            guard let self, self.tapOnlyCodes == nil else { return }
-            self.keyRemapChanged()
-        }
+        applyKeyRemapOverride()
+        injector.setTopRowChoices(topRowChoices.strategies())
         injector.setCapsModePreference(capsModePreference)
         injector.setFnTapPreference(fnTapPreference)
         applyTuning()
-        injector.apply(readings: readings)
         refreshCapsMode()
 
         arbiterTimer.setEventHandler { [weak self] in
@@ -233,6 +305,7 @@ final class ReceiverModel: ObservableObject {
         restartWork?.cancel()
         wakeWork?.cancel()
         clearPasteboardWork?.cancel()
+        noticeExpiryWork?.cancel()
         for (center, observer) in observers { center.removeObserver(observer) }
         listener?.cancel()
     }
@@ -259,6 +332,11 @@ final class ReceiverModel: ObservableObject {
     /// after 60 s (only if nothing else was copied since).
     func copyPairingKey() {
         guard let secret else { return }
+        // Copying the key is what a pairing hint asks for.
+        if case .pairingHint? = notice {
+            notice = nil
+            refreshStatus()
+        }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         let item = NSPasteboardItem()
@@ -289,18 +367,18 @@ final class ReceiverModel: ObservableObject {
             if listener != nil || restartWork != nil { restartListenerNow() }
             updateReceiver()
         case .unavailable(let code):
-            notice = "Could not save a new pairing key (error \(code)). The current key stays in effect."
+            notice = .keyRotationFailed(code)
             refreshStatus()
         }
     }
 
-    /// Resume shim (the menu's Start).
+    /// Resume shim.
     func start() {
         refreshPermission()
         isPaused = false
     }
 
-    /// Pause shim (the menu's Stop).
+    /// Pause shim (used before quitting).
     func stop() {
         isPaused = true
     }
@@ -323,9 +401,51 @@ final class ReceiverModel: ObservableObject {
     func pairAnotherIPad() {
         isPairingAnother = true
         pairingAnotherExcludedClient = arbiter.activeID.flatMap { sessions[$0]?.hello?.client }
-        notice = Self.pairAnotherNotice
+        notice = .pairAnother
         refreshStatus()
     }
+
+    /// Ends pair-another without a new iPad (the panel's Done): hides the key controls, drops the
+    /// instructions and clears a copied key from the clipboard.
+    func finishPairingAnother() {
+        guard isPairingAnother else { return }
+        isPairingAnother = false
+        pairingAnotherExcludedClient = nil
+        if notice == .pairAnother { notice = nil }
+        clearCopiedKey()
+        refreshStatus()
+    }
+
+    /// Posts one top-row function with `s` as a down then an up ('Check Top-Row Keys').
+    func tryTopRow(_ f: TopRowFunction, _ s: TopRowStrategy) {
+        guard hasInputPermission else { return }
+        injector.postTopRowTest(f, strategy: s)
+    }
+
+    /// Adds or replaces a manual remap pair (source → target keycode).
+    func setManualRemap(_ source: UInt16, to target: UInt16) {
+        guard manualKeyRemap[source] != target else { return }
+        manualKeyRemap[source] = target
+        manualRemapChanged()
+    }
+
+    func removeManualRemap(_ source: UInt16) {
+        guard manualKeyRemap.removeValue(forKey: source) != nil else { return }
+        manualRemapChanged()
+    }
+
+    /// Re-reads the Open at login state (the user may have approved or removed it in System Settings).
+    func refreshLoginItem() {
+        syncLoginItem(SMAppService.mainApp.status)
+    }
+
+    func openLoginItemsSettings() {
+        SMAppService.openSystemSettingsLoginItems()
+    }
+
+    /// A build run from Xcode's DerivedData: Open at login would register a copy that moves or
+    /// disappears with the next clean build.
+    var runsFromBuildFolder: Bool { Bundle.main.bundlePath.contains("/DerivedData/") }
 
     // MARK: Receiver lifecycle
 
@@ -581,7 +701,7 @@ final class ReceiverModel: ObservableObject {
         case .releaseAllInput:
             injector.releaseAll()
         case .showPairingHint(let host):
-            notice = "An iPad at \(host) could not connect. Paste this Mac's pairing key in iKey on that iPad."
+            notice = .pairingHint(host: host)
             refreshStatus()
         }
     }
@@ -593,7 +713,8 @@ final class ReceiverModel: ObservableObject {
         connectedDeviceName = session.hello.map { $0.device.isEmpty ? "iPad" : $0.device } ?? "iPad"
         power.sessionStarted(id)
         // The already-paired iPad reconnecting while another is being paired keeps the key
-        // controls, the hint and the copied key; any other iPad ends pairing-another.
+        // controls, the pair-another instructions and the copied key; any other iPad ends
+        // pairing-another. Either way a live session clears drop notices and hints.
         let samePadReconnected = isPairingAnother && pairingAnotherExcludedClient != nil
             && session.hello?.client == pairingAnotherExcludedClient
         if !samePadReconnected {
@@ -601,8 +722,8 @@ final class ReceiverModel: ObservableObject {
             pairingAnotherExcludedClient = nil
             notice = nil
             clearCopiedKey()
-        } else if notice == Self.droppedNotice {
-            notice = Self.pairAnotherNotice
+        } else {
+            notice = .pairAnother
         }
         refreshStatus()
         guard version >= 2 else { return }
@@ -639,7 +760,7 @@ final class ReceiverModel: ObservableObject {
             isConnected = connected
             if !connected {
                 connectedDeviceName = nil
-                if !endingDeliberately { notice = Self.droppedNotice }
+                if !endingDeliberately { notice = .dropped }
             }
             refreshStatus()
         }
@@ -666,8 +787,11 @@ final class ReceiverModel: ObservableObject {
 
     // MARK: Polling
 
+    /// Every 2 s. While listening it is the only trigger of the injector's remap read
+    /// (hidutil, Modifier Keys, Karabiner); idle, nothing is read (amendment J).
     private func slowPoll() {
         refreshPermission()
+        refreshCapsHardware()
         if isListening { pollPreferences() }
     }
 
@@ -677,13 +801,17 @@ final class ReceiverModel: ObservableObject {
         // (hidutil, Modifier Keys, Karabiner are not part of MacReadings; amendment C). Equal
         // settings make the injector's rebuild a no-op; the remap read runs off-main.
         injector.apply(readings: fresh)
+        // The injector may only now have readings (none are handed over before listening, so
+        // idle spawns no hidutil): its caps mode can change although `fresh == readings`.
+        refreshCapsMode()
+        refreshCapsHardware()
         guard fresh != readings else { return }
         let prefsChanged = fresh.prefs != readings.prefs
         let nameChanged = fresh.computerName != readings.computerName
         readings = fresh
         let shownIndex = fresh.liveCurves.trackingIndex ?? fresh.prefs.trackingIndex
         if shownIndex != trackingIndexShown { trackingIndexShown = shownIndex }
-        refreshCapsMode()
+        if fresh.prefs.fnKeysStandard != fnKeysStandard { fnKeysStandard = fresh.prefs.fnKeysStandard }
         if prefsChanged { activeV2Session?.stream.send([stateMessage(prefs: fresh.prefs.clamped())]) }
         if nameChanged {
             serviceName = Self.serviceName(for: fresh.computerName)
@@ -705,6 +833,14 @@ final class ReceiverModel: ObservableObject {
         if mode != capsMode { capsMode = mode }
     }
 
+    /// The injector only falls back to virtual in `.system` mode; in `.switchesInputSource` a
+    /// failing hardware lock just loses the long-press toggle, which the menu says. An unreachable
+    /// IOHIDSystem lock state is the observable sign of it.
+    private func refreshCapsHardware() {
+        let unavailable = capsMode == .switchesInputSource && CapsLockHardware.read() == nil
+        if unavailable != capsHardwareUnavailable { capsHardwareUnavailable = unavailable }
+    }
+
     private func applyTuning() {
         injector.setTuning(gainScale: min(max(gainScale, 0.75), 1.25),
                            scrollSpeedFactor: min(max(scrollSpeedFactor, 0.5), 2.0))
@@ -712,16 +848,52 @@ final class ReceiverModel: ObservableObject {
 
     // MARK: Key remap
 
-    /// Mirrors the injector's remap and tells a v2 iPad when its tap-only codes change. Called on
-    /// each injector change and once at the settle delay; from then on the codes are known (an
-    /// empty set is sent explicitly, clearing a stale persisted set on the iPad).
+    /// Mirrors the injector's effective remap and resends MacState(tapOnly:) to a v2 iPad
+    /// whenever it changes. The codes are known once the first remap read finished, or at once
+    /// while mirroring is off (nothing is remapped then); from then on an empty set is sent
+    /// explicitly, clearing a stale persisted set on the iPad.
     private func keyRemapChanged() {
         let remap = injector.keyRemap
         if remap != keyRemap { keyRemap = remap }
-        let codes = remap.tapOnlyPadCodes.sorted()
-        guard codes != tapOnlyCodes else { return }
-        tapOnlyCodes = codes
+        let detected = injector.detectedKeyRemap
+        if detected != detectedKeyRemap { detectedKeyRemap = detected }
+        let read = injector.hasReadKeyRemap
+        if read != hasReadKeyRemap { hasReadKeyRemap = read }
+        if applyKeyRemap && !read {
+            // Mirroring turned on before the first read: the codes are unknown again, so MacState
+            // must not clear the iPad's saved set with the [] computed while mirroring was off.
+            tapOnlyCodes = nil
+            mirroredRemapMap = nil
+            return
+        }
+        guard remap.map != mirroredRemapMap else { return }
+        mirroredRemapMap = remap.map
+        tapOnlyCodes = remap.tapOnlyPadCodes.sorted()
         activeV2Session?.stream.send([stateMessage()])
+    }
+
+    /// Hands the toggle and the manual pairs to the injector; its change callback (and the
+    /// direct call here, for an unchanged map) updates the published remap and the iPad.
+    private func applyKeyRemapOverride() {
+        injector.setKeyRemapOverride(apply: applyKeyRemap, manual: manualKeyRemap.isEmpty ? nil : manualKeyRemap)
+        keyRemapChanged()
+    }
+
+    private func manualRemapChanged() {
+        defaults.set(Dictionary(uniqueKeysWithValues: manualKeyRemap.map { (String($0.key), Int($0.value)) }),
+                     forKey: Keys.manualKeyRemap)
+        applyKeyRemapOverride()
+    }
+
+    /// Stored as ["<source>": target]; malformed entries are skipped.
+    private static func decodeManualRemap(_ stored: [String: Any]?) -> [UInt16: UInt16] {
+        var pairs: [UInt16: UInt16] = [:]
+        for (key, value) in stored ?? [:] {
+            guard let source = UInt16(key), let target = (value as? NSNumber).flatMap({ UInt16(exactly: $0.intValue) })
+            else { continue }
+            pairs[source] = target
+        }
+        return pairs
     }
 
     // MARK: Pasteboard, login item, status
@@ -742,13 +914,20 @@ final class ReceiverModel: ObservableObject {
         } catch {
             Self.log.error("Open at login: \(error.localizedDescription, privacy: .public)")
         }
-        if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
-        let enabled = Self.loginItemEnabled(service.status)
+        let status = service.status
+        if status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
+        syncLoginItem(status)
+    }
+
+    private func syncLoginItem(_ status: SMAppService.Status) {
+        let enabled = Self.loginItemEnabled(status)
         if enabled != launchAtLogin {
             syncingLoginItem = true
             launchAtLogin = enabled
             syncingLoginItem = false
         }
+        let needsApproval = status == .requiresApproval
+        if needsApproval != loginItemNeedsApproval { loginItemNeedsApproval = needsApproval }
     }
 
     private func refreshStatus() {
@@ -763,9 +942,9 @@ final class ReceiverModel: ObservableObject {
             // A pairing hint, pair-another instructions or a key-rotation failure must reach the
             // user while an iPad is connected (the usual state for these actions).
             let connected = "Connected to \(connectedDeviceName ?? "iPad"). Keyboard and trackpad are ready."
-            text = notice.map { connected + " " + $0 } ?? connected
+            text = notice.map { connected + " " + $0.text } ?? connected
         } else if let notice {
-            text = notice
+            text = notice.text
         } else if listenerTrouble {
             text = "Waiting for the local network. Check Wi-Fi and the Local Network permission in System Settings."
         } else if isPaired {
@@ -774,6 +953,20 @@ final class ReceiverModel: ObservableObject {
             text = "Ready to pair. Copy the pairing key and paste it in iKey on your iPad."
         }
         if status != text { status = text }
+    }
+
+    private func scheduleNoticeExpiry() {
+        noticeExpiryWork?.cancel()
+        noticeExpiryWork = nil
+        guard let current = notice, current.expires else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.notice == current else { return }
+            self.noticeExpiryWork = nil
+            self.notice = nil
+            self.refreshStatus()
+        }
+        noticeExpiryWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.noticeLifetime, execute: work)
     }
 
     // MARK: Helpers

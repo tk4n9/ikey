@@ -131,11 +131,16 @@ final class DeckTouchView: UIView {
     private var indicatorShapes: [CAShapeLayer] = []
     /// Keys currently drawn pressed (drawn and photo mode).
     private var shownPressed: Set<UInt16> = []
-    /// The images on screen and the render in flight (equal once it lands).
+    /// The images on screen.
     private var shown: RenderedDeck?
+    /// The newest wanted render: the one in flight, or the one queued behind it.
     private var requestedRender: RenderKey?
     /// True while a render runs; a newer request waits for it and only the latest one is rendered.
     private var renderInFlight = false
+    /// Sequence number of the last render launched (monotonic).
+    private var renderSequence = 0
+    /// Sequence of what is on screen; a landing render at or below it is older and dropped.
+    private var shownSequence = 0
     private var previewCommit: DispatchWorkItem?
     private var ringState: RingState = .hidden
 
@@ -586,7 +591,8 @@ final class DeckTouchView: UIView {
 
     /// At most one render runs and at most one waits: a request made while a render runs only replaces
     /// `requestedRender`, and the newest request starts when the running one lands. A continuous change
-    /// (tone slider, live resize) therefore never queues a backlog of superseded renders.
+    /// (tone slider, live resize) therefore never queues a backlog of superseded renders, and each render
+    /// that lands is shown, so the deck follows the drag about once per render time.
     private func startRender(_ key: RenderKey) {
         previewCommit?.cancel()
         previewCommit = nil
@@ -597,20 +603,24 @@ final class DeckTouchView: UIView {
     private func launchRenderIfIdle() {
         guard !renderInFlight, let key = requestedRender, key != shown?.key else { return }
         renderInFlight = true
+        renderSequence += 1
+        let sequence = renderSequence
         SceneRenderer.renderAsync(key) { [weak self] deck in
-            MainActor.assumeIsolated { _ = self?.renderLanded(deck) }
+            MainActor.assumeIsolated { _ = self?.renderLanded(deck, sequence: sequence) }
         }
     }
 
-    private func renderLanded(_ deck: RenderedDeck) {
+    private func renderLanded(_ deck: RenderedDeck, sequence: Int) {
         renderInFlight = false
-        applyRendered(deck)
+        applyRendered(deck, sequence: sequence)
         launchRenderIfIdle()
     }
 
     private func clearRender() {
         previewCommit?.cancel()
         previewCommit = nil
+        // The cleared deck counts as the newest display: a render still in flight lands as older.
+        shownSequence = renderSequence
         guard shown != nil || requestedRender != nil else { return }
         shown = nil
         requestedRender = nil
@@ -625,8 +635,14 @@ final class DeckTouchView: UIView {
         configureRing()
     }
 
-    private func applyRendered(_ deck: RenderedDeck) {
-        guard deck.key == requestedRender else { return }
+    /// Shows a landed render unless it is older than the one on screen. A render superseded by a newer
+    /// request is still shown (an intermediate frame of a drag); the newer one follows it. After a
+    /// clear, a render launched before it is still shown when it is exactly the one wanted again
+    /// (a quick drawn → photo → drawn toggle), instead of being rendered a second time.
+    private func applyRendered(_ deck: RenderedDeck, sequence: Int) {
+        let wantedAfterClear = shown == nil && deck.key == requestedRender
+        guard sequence > shownSequence || wantedAfterClear else { return }
+        shownSequence = max(shownSequence, sequence)
         shown = deck
         let size = deck.key.look.size, scale = deck.key.look.displayScale
         let ppm = CGFloat(deck.key.projection.ppm)

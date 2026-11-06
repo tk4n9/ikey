@@ -1,137 +1,265 @@
 # First run on your Mac
 
-Each block aims for 30 seconds to two minutes of hands-on work. Downloads, first
-builds, device preparation, and restarts can take longer; wait for them to finish
-before the next dependent block. Skip prerequisites already completed.
+Each block takes 30 seconds to two minutes of hands-on work. Downloads, first
+builds and device preparation take longer; wait for them before the next block.
+Skip any block you have already done.
 
-This prototype has not yet been built against Apple's SDKs. If a command/build
-fails, stop and capture the first error rather than proceeding through the rest.
+Status: the macOS CI job builds and typechecks both apps on every push. **Neither
+app has been run on a device with this version yet.** If a command or build
+fails, stop and capture the first error instead of continuing.
 
-1. **Install Xcode.** Install the newest stable Xcode compatible with your Mac
-   from the Mac App Store. Start the download, then wait. Command Line Tools alone
-   are not enough. The project targets macOS 13+ and iPadOS 17+.
+## Build
 
-2. **Finish Xcode setup.** Open Xcode from Applications. Review/accept its terms
-   and install requested components, including iOS support. Wait for completion.
+1. **Install Xcode.** Install the newest stable Xcode for your Mac from the Mac App
+   Store. Command Line Tools alone are not enough. The project targets macOS 13+
+   and iPadOS 17+.
 
-3. **Select full Xcode.** In Terminal, run:
+2. **Finish Xcode setup.** Open Xcode once, accept its terms and install the
+   components it asks for, including iOS support.
+
+3. **Select full Xcode.** In Terminal:
 
    ```sh
    sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
    xcodebuild -version
    ```
 
-   Expected: an Xcode version. Adjust the application path if yours differs.
-
-4. **Enter the copied source directory.** In Terminal, type `cd `, drag the outer
-   copied `ikey` folder from Finder into Terminal, and press Return. Then run:
+4. **Enter the source directory.** Type `cd `, drag the outer copied `ikey`
+   folder from Finder into Terminal, press Return, then:
 
    ```sh
    cd repo/ikey
    ls project.yml
    ```
 
-   Keep this terminal open. Later commands assume this directory.
+   Later commands assume this directory.
 
-5. **Check Homebrew.** Run `brew --version`. If missing, install using the command
-   from https://brew.sh/ and follow its printed Next steps. Wait for completion.
-
-6. **Install XcodeGen.** Run `brew install xcodegen`, then wait. Verify with
+5. **Install XcodeGen.** If `brew --version` fails, install Homebrew from
+   https://brew.sh/ first. Then run `brew install xcodegen` and check with
    `xcodegen --version`.
 
-7. **Run the shared tests.** Run
-   `xcrun swift test --package-path Shared --scratch-path "$HOME/Library/Caches/iKey/swift"`. Expect
-   XCTest tests to pass with zero failures. The first compile may take longer.
+6. **Set up stable signing (once).** Create `Config/Local.xcconfig`. Git ignores
+   it, and it survives project regeneration:
 
-8. **Generate the project.** Run `sh scripts/generate-project.sh`.
-   Expected: `iKey.xcodeproj` appears in the current directory.
+   ```text
+   DEVELOPMENT_TEAM = ABCDE12345
+   CODE_SIGN_IDENTITY = Apple Development
+   // Only if com.ikey.* is unavailable to your team:
+   // IKEY_BUNDLE_ID_PREFIX = com.yourname.ikey
+   ```
 
-9. **Check native compilation.** Run `sh scripts/check-macos.sh`, then wait.
-   It builds the Mac and iPad-simulator targets without installing them. Expect
-   both builds to succeed. If they fail, capture the first error.
+   Find your team ID in Xcode › Settings › Apple Accounts (Accounts in older
+   versions), or at developer.apple.com. The bundle identifiers are
+   `$(IKEY_BUNDLE_ID_PREFIX).mac` and `.pad`, with the prefix `com.ikey` by
+   default. **Do not edit the identifier in Xcode's Signing tab.** Xcode shows the
+   unexpanded variable there, and a change made there is lost when the project
+   is regenerated. With every build signed by the same certificate, macOS keeps
+   iKey's Accessibility grant and Keychain access. An ad-hoc signature would
+   prompt again after each rebuild.
 
-   Build products stay in this account's `~/Library/Caches/iKey`, outside Dropbox.
-   This avoids carrying absolute paths from another Mac's account. Existing
-   `Shared/.build` products are bypassed; source files do not need to be recloned.
+7. **Run the checks.**
 
-10. **Open the project.** Run `open iKey.xcodeproj`. Wait for Xcode to finish
-    resolving/indexing the local package.
+   ```sh
+   ./scripts/check-macos.sh
+   ```
 
-11. **Add your Apple account.** In Xcode Settings, open Apple Accounts (Accounts
-    in older versions), and sign in if needed.
+   This runs the shared tests, generates `iKey.xcodeproj` and builds both apps
+   unsigned for checking. Build products stay in `~/Library/Caches/iKey`, outside
+   any synced folder. If the iPad build reports that the iOS platform is missing,
+   run `xcodebuild -downloadPlatform iOS` once.
 
-12. **Configure iPad signing.** Select the blue project icon, target `iKeyPad`,
-    then Signing & Capabilities. Enable automatic signing and choose your team
-    (Personal Team if available). If the identifier is unavailable, replace
-    `com.ikey.pad` with a unique identifier such as `com.yourname.ikey.pad`.
+8. **Open the project.** Run `open iKey.xcodeproj` and wait for indexing to
+   finish. Sign in under Xcode › Settings › Apple Accounts if needed.
 
-13. **Configure Mac signing.** Select target `iKeyMac` and choose the same signing
-    team. Resolve any identifier conflict in the same way. Do not regenerate the
-    project after these UI changes unless you record them in `project.yml` first.
+## Mac app
 
-14. **Pair the iPad with Xcode.** Connect it with a data-capable USB cable, unlock
-    it, and accept Trust/Allow prompts. Select it in Xcode's run-destination menu
-    to initiate pairing. Wait for device preparation if requested.
+9. **Run iKeyMac.** Choose scheme `iKeyMac`, destination **My Mac**, and press
+   ⌘R. A keyboard icon appears in the menu bar. iKey has no Dock icon.
 
-15. **Enable Developer Mode.** On the iPad, open Settings → Privacy & Security →
-    Developer Mode. Enable it, restart, then confirm enabling it after restart.
-    If the setting is missing, complete Xcode pairing first.
+10. **Allow input control.** Open the menu and choose **Allow Input Control**.
+    Turn on iKeyMac in System Settings › Privacy & Security › Accessibility, then
+    choose **Check Again**. If it was already on, quit and reopen iKey. **Show
+    This App in Finder** reveals the exact copy to grant.
 
-16. **Run the Mac app.** In Xcode's top toolbar choose scheme `iKeyMac`, destination
-    My Mac, and press Command-R. Look for the keyboard icon in the Mac menu bar.
-    The first build may take longer.
+11. **Allow the Keychain and Local Network.** On first start iKey creates its
+    pairing key in the Keychain. If macOS asks whether iKeyMac may use the
+    "iKey pairing key" item, choose **Always Allow**. If you deny it, the menu
+    shows the Keychain error with **Retry**, and iKey never invents a new key on
+    its own. Allow Local Network access if macOS asks.
 
-17. **Allow Mac input control.** Open that icon and choose Allow Input Control.
-    Enable iKeyMac in System Settings → Privacy & Security → Accessibility
-    (or the input-control category named by your macOS prompt). Return to iKey
-    and choose Check Again; relaunch if macOS requests it.
+12. **Check the receiver.** The menu should say **Ready to pair. Copy the pairing
+    key and paste it in iKey on your iPad.**
 
-18. **Start the receiver.** Click Start Receiver. Allow Local Network access if
-    prompted. Expected: a message saying the receiver is ready.
+13. **Open at login (recommended).** Turn on **Open at login** in the menu. If
+    macOS asks for approval, System Settings › General › Login Items opens; allow
+    iKeyMac there. A login item registered from Xcode's DerivedData build moves
+    when that folder is cleaned, and the menu shows a hint in that case. Copy
+    the built app to /Applications for a durable login item.
 
-19. **Run the iPad app.** In Xcode choose scheme `iKeyPad`, select your physical
-    iPad, and press Command-R. Allow Local Network access when asked. Wait for
-    installation/device preparation. Follow any developer-trust prompt shown.
+## iPad app
 
-20. **Connect the two apps.** Keep both on the same Wi-Fi network. In the Mac
-    menu-bar app choose Copy Pairing Key. On iPad select your Mac, paste the key,
-    and tap Connect. Universal Clipboard can transfer the key when configured;
-    otherwise use Show on the Mac and enter the 64 hexadecimal characters.
+14. **Prepare the iPad.** Connect it by USB, unlock it, accept the Trust prompt
+    and select it as the run destination in Xcode. If Xcode asks, turn on
+    Settings › Privacy & Security › Developer Mode on the iPad and restart.
 
-21. **Test before adding the photo.** On iPad tap Use touch surface. On Mac open
-    a new TextEdit document. Test a few letters, Shift plus a letter, trackpad
-    movement, and a tap. Expected: text/pointer responses on the Mac.
+15. **Run iKeyPad.** Choose scheme `iKeyPad`, your iPad, and press ⌘R. Allow
+    Local Network access when asked. Keep the iPad in landscape.
 
-22. **Prepare the photograph.** Take one straight-down photograph of the desired
-    MacBook's lower deck. Keep keyboard, trackpad, and palm rests in frame. Crop
-    away the screen and desk. Leave fine photo adjustments for another block.
+16. **Pair once.** On the Mac choose **Copy** under Pairing; Universal Clipboard
+    carries the key over. On the iPad, the pairing card on the left palm rest
+    lists nearby Macs. Pick yours, paste the 64-character key and tap
+    **Connect**. Without Universal Clipboard, choose **Show** on the Mac and type
+    the key. The copied key is hidden from clipboard history and cleared from
+    the Mac's clipboard after pairing or after 60 s.
 
-23. **Put the photo in iPad Photos.** Transfer it, for example with AirDrop, and
-    save it to Photos. If leaving iKey disconnects it, that is expected; reconnect
-    after returning.
+17. **Test.** Open a new TextEdit document on the Mac. Tap a few letters, a
+    ⇧ capital and ⌘Z. Slide one finger on the drawn trackpad, then tap to click.
+    A resting hand should type nothing; see
+    [touch behavior](touch-behavior.md).
 
-24. **Import it.** Open iKey's gear button → Choose a photo. Select your image.
-    Settings pause input; the photo stays stored locally on the iPad.
+18. **Check the scale.** Hold the Touch ID key (top right) for 0.6 s to open
+    the settings panel, then choose **Fit & size…** and follow
+    [true-scale setup](true-scale-setup.md).
 
-25. **Align the keyboard.** Open Align keys and trackpad with the photo. Choose
-    Keyboard and adjust Left, Top, Width, and Height until the outline fits.
+From now on, the iPad reconnects by itself: after relaunches, Control Center,
+the app switcher, iPad lock and Mac sleep. You never paste the key again unless
+you choose **New Key** on the Mac or **Forget this Mac** on the iPad.
 
-26. **Align the trackpad.** Choose Trackpad and adjust its outline. Tap Save.
-    If validation reports an overlap, separate the keyboard and trackpad bounds.
+## The receiver is always on
 
-27. **Correct one key at a time.** Reopen alignment, choose Single key, select a
-    misaligned key, adjust its rectangle, and save. Repeat this block only as
-    needed. Exact whole-keyboard calibration may require several blocks.
+The Mac app listens whenever it runs, unless one of these applies:
 
-28. **Use and check cleanup.** Reconnect if necessary and tap Use touch surface.
-    Test typing and clicking over the photograph. Hold Shift, open settings,
-    then type normally again; the modifier should have been released.
+- it is paused;
+- the Mac is asleep;
+- input permission is missing;
+- the Keychain cannot be read.
 
-Your first useful milestone is block 21. Photo fidelity comes afterward. Aspect
-ratio differences may leave black bars; the app preserves the photo rather than
-stretching it. Calibration starts from US ANSI key meanings.
+**Pause iKey** stops it for this session only; relaunching iKey always starts
+it. While an iPad is connected, the menu shows its name and **Disconnect iPad**.
+After a disconnect, the iPad waits until its deck is touched. While a session is
+active and for 10 minutes after it, iKey keeps the Mac from idle sleep and itself
+from App Nap. iKey input also counts as user activity, so the display stays
+awake while you type only on the iPad.
 
-Sources: [XcodeGen installation](https://github.com/yonaskolb/XcodeGen),
+## Pairing key and Keychain
+
+- The key stays the same until you choose **New Key**. Paired iPads are then
+  told to unpair and need the new key.
+- **Pair another iPad…** shows Copy and Show again while one iPad is paired.
+  The newest iPad that connects takes over. The previous one shows **In use by
+  another iPad — touch to switch**.
+- The key lives in the Mac's Keychain (device-only, never synced) and in each
+  iPad's Keychain (device-only). Details:
+  [protocol](protocol.md#pairing-key).
+- A Keychain error shows a line with **Retry**. An item that exists but cannot
+  be read also offers **New Key** to reset pairing.
+
+## Caps Lock and input sources
+
+A real MacBook applies Caps Lock behaviour in its keyboard driver, which posted
+events bypass. iKey therefore implements it on the Mac. The menu's **Caps Lock**
+setting:
+
+| Choice | Behaviour |
+|---|---|
+| **Automatic** (default) | **Switches input source** when the Mac's "Use the Caps Lock key to switch to and from ABC" is on and more than one input source is enabled; otherwise **Turns caps lock on**. |
+| **Turns caps lock on** | The real system lock. A press shorter than 75 ms is ignored, like the hardware key. Each change is read back. If the Mac refuses it, iKey falls back to Virtual and the menu says so. |
+| **Switches input source** | A tap shorter than 0.5 s switches to the previous input source (`TISSelectInputSource`; the "Select the previous input source" shortcut only if that fails). A hold of 0.5 s or longer toggles Caps Lock. If the Mac refuses the Caps Lock change, only the hold is lost: the menu says "Long-press Caps Lock toggle unavailable; input switching still works". |
+| **Virtual** | An iKey-only lock carried in the event flags; the system indicator does not change. |
+
+The iPad's Caps Lock LED follows the Mac's state within about 0.1 s (Virtual
+mode: the virtual lock). At the default 1:1 placement the left edge of the deck
+is clipped by the screen edge, so the LED is mostly off screen; see
+[true-scale setup](true-scale-setup.md#placement).
+
+Setting up the remapped left ⌘ as an input switch:
+
+1. Turn on "Use the Caps Lock key to switch to and from ABC" in System Settings ›
+   Keyboard › Text Input › Input Sources › Edit.
+2. Map left ⌘ to Caps Lock (see [key remapping](#key-remapping)).
+3. Leave **Caps Lock** on Automatic. A tap of the drawn left ⌘ then switches
+   between, for example, Korean and English. This is designed to work even with
+   ⌃Space turned off in Keyboard Shortcuts (not yet confirmed on a device).
+
+The **Globe key** setting is described in [top row](top-row.md#globe-fn-key).
+
+## Key remapping
+
+Many people remap keys on the Mac. This user, for example, maps **left ⌘ → Caps
+Lock** and **Caps Lock → Escape**. macOS applies remapping only to events from
+real keyboards: hidutil `UserKeyMapping`, System Settings › Keyboard › Keyboard
+Shortcuts › Modifier Keys, and Karabiner-Elements all act on the hardware event
+stream. **Events that iKey posts bypass every one of them.** Without help, the
+iPad's left ⌘ would act as ⌘ and its Caps Lock as Caps Lock, so a deck that
+looks like your MacBook would behave differently. iKey therefore mirrors your
+remap itself.
+
+What it reads, every 2 s while the receiver listens:
+
+- `hidutil property --get UserKeyMapping` (2 s timeout);
+- the **Modifier Keys** settings for the **built-in** keyboard only. Settings
+  for external keyboards never apply;
+- Karabiner-Elements `~/.config/karabiner/karabiner.json`: the selected
+  profile's simple modifications, plus the per-device entries for the built-in
+  keyboard. Only one-to-one key mappings are mirrored. Complex modifications,
+  pointing buttons and multi-key outputs are not.
+
+The layers merge per key, last one wins, in this order: hidutil, Modifier Keys,
+Karabiner, then iKey's manual pairs. A layer whose read fails keeps its last
+good pairs, so one failed read never drops your remap.
+
+The Mac applies the remap to every key from the iPad **first**, before
+modifiers, the fn layer, the top row, Caps Lock and repeat. A key is released
+with the same mapping it was pressed with, even if the remap changes in
+between. The iPad keeps **drawing** the real legends (command, caps lock),
+because those are the keys under your fingers.
+
+The menu's **Key remapping** section shows:
+
+- the detected layers, and the effective mapping in words (for example
+  "Left ⌘ → Caps Lock, Caps Lock → Esc — from Karabiner");
+- **Apply my Mac's key remapping** (on by default). Off posts every key as
+  drawn;
+- a small editor for extra manual pairs;
+- **Left ⌘ acts as Caps Lock / input switch (tap only)** when that applies.
+
+**Tap-only keys.** When a modifier is remapped to something that is not a
+modifier, the Mac tells the iPad, and the deck types that key **only as a tap**.
+It never chords. With resting fingers on (Home row, the default, or All typing
+keys) it never presses when rested on. A tap of the user's left ⌘ switches input
+source as on the real MacBook. Holding it does nothing, so the macOS long-press
+Caps Lock toggle is not available from that key. With resting fingers Off, the
+key goes down after 45 ms and stays down while held, like a real Caps Lock key,
+so a long hold can toggle Caps Lock. See
+[touch behavior](touch-behavior.md#tap-only-keys).
+
+## Optional: Deck check and Input Monitoring
+
+**Deck check…** in the menu opens a window that counts input events on the
+Mac **not** posted by iKey, for 2 minutes, by type only. It was meant to show
+whether the real keyboard and trackpad register through an iPad lying on them.
+iKey's own events carry a tag and are not counted. Any other device, such as an
+external keyboard or mouse, would be counted, so keep them still. The check
+needs **Input Monitoring** (System Settings › Privacy & Security); iKey asks when
+you start it. Nothing is recorded except the counts, and **Copy result** copies
+them for [device validation](device-validation.md). The everyday setup does not
+need this.
+
+**Check Top-Row Keys…** is described in [top row](top-row.md).
+
+## Troubleshooting
+
+- **The iPad says "Update iKey on your Mac".** The Mac runs an older iKey (protocol
+  v1). Build and run the current iKeyMac.
+- **"Can't reach <Mac> — the pairing key may have changed".** The Mac's key was
+  replaced, or it is a different Mac. Copy the key again and paste it in the
+  pairing card. The old pairing is kept until the new one works.
+- **No Mac in the pairing card.** Keep both devices on the same Wi-Fi, check
+  Local Network access on both, and make sure the Mac menu says Ready.
+- **Prompts after every rebuild.** Signing is ad hoc; set up `Config/Local.xcconfig`
+  (block 6).
+
+Sources: [XcodeGen](https://github.com/yonaskolb/XcodeGen),
 [Homebrew](https://brew.sh/),
 [Apple signing guidance](https://developer.apple.com/documentation/xcode/distributing-your-app-to-registered-devices),
 [Developer Mode](https://developer.apple.com/documentation/xcode/enabling-developer-mode-on-a-device),

@@ -61,8 +61,15 @@ final class PadModel: ObservableObject {
     // Legacy members (pairing sheet, calibration, photo mode).
     @Published private(set) var peers: [MacPeer] = []
     @Published var selectedPeerID = ""
-    @Published var pairingText = ""
-    @Published var message: String?
+    /// Editing the key is a user action that answers a failed pairing's message.
+    @Published var pairingText = "" {
+        didSet { if pairingText != oldValue { clearPairingFailure() } }
+    }
+    /// Any other text written here (by the model or a view) supersedes a failed pairing's message,
+    /// so a later reconnect never brings the stale failure back over it.
+    @Published var message: String? {
+        didSet { if let failure = pairingFailure, message != failure { pairingFailure = nil } }
+    }
     @Published private(set) var isRefreshing = false
     @Published private(set) var discoveryStatus = "Search for your Mac after starting its receiver."
     @Published private(set) var photo: UIImage?
@@ -208,6 +215,10 @@ final class PadModel: ObservableObject {
     private var record: PairingRecord?
     private var pairedSecret: PairingSecret?
     private var pendingPairing: PendingPairing?
+    /// Why the last pasted-key pairing failed. It stays in `message` when the supervisor then
+    /// reconnects the previously paired Mac; the next user action, a successful pairing or any newer
+    /// `message` clears it.
+    private var pairingFailure: String?
     private var attempt: LinkAttempt?
     /// Streams closing with a goodbye stay alive until it is handed to the network.
     private var closingStreams: [ObjectIdentifier: PadLinkStream] = [:]
@@ -293,10 +304,13 @@ final class PadModel: ObservableObject {
 
     // MARK: Deck callbacks
 
-    /// Deck output stamped with the touch time (seconds on the system-uptime clock).
+    /// Deck output stamped with the touch time (seconds on the system-uptime clock). Outside `.live`
+    /// only releases go out: the deck's releaseAll and key/button ups often arrive after the mode
+    /// has already changed, and the Mac must not keep those keys held until heartbeat reconciliation.
     func send(_ inputs: [PadInput], at touchTime: TimeInterval) {
-        guard deckInputMode == .live, let stream = liveStream else { return }
-        let batch = PadInput.coalesced(inputs)
+        guard let stream = liveStream else { return }
+        var batch = PadInput.coalesced(inputs)
+        if deckInputMode != .live { batch = batch.filter(Self.releasesState) }
         guard !batch.isEmpty else { return }
         let t = Self.micros(touchTime.isFinite ? touchTime : now)
         stream.send(batch.map { PadMessage.input($0, t: t) })
@@ -369,6 +383,7 @@ final class PadModel: ObservableObject {
     /// Pairs with the selected Mac using the pasted key, or reconnects the paired Mac when no key
     /// is pasted. The pasted key is cleared only after the Mac's welcome.
     func connect() {
+        pairingFailure = nil
         let text = trimmedPairingText
         if text.isEmpty {
             guard isPaired else {
@@ -409,19 +424,22 @@ final class PadModel: ObservableObject {
         guard pendingPairing != nil else { return }
         pendingPairing = nil
         if case .macTooOld = supervisor.state {
-            message = "\(macName ?? "Your paired Mac") needs an iKey update. Update it, or Forget it to pair a different Mac."
+            // Not sticky: once that Mac is updated and reconnects, its welcome clears the text.
+            message = pairedMacNeedsUpdateMessage
         } else {
-            message = "Could not start pairing. Try again."
+            showPairingFailure("Could not start pairing. Try again.")
         }
     }
 
     func disconnect() {
         pendingPairing = nil
+        clearPairingFailure()
         handle(.userDisconnect)
     }
 
     func forgetPairing() {
         pendingPairing = nil
+        clearPairingFailure()
         handle(.forgot)
         welcome = nil
         macPrefs = nil
@@ -445,6 +463,7 @@ final class PadModel: ObservableObject {
 
     /// Restarts discovery (Refresh); does nothing while connected, when no browser should run.
     func startDiscovery() {
+        clearPairingFailure()
         guard browsingWanted else { return }
         startBrowser()
     }
@@ -465,11 +484,13 @@ final class PadModel: ObservableObject {
         try store.saveLayout(valid)
         layout = valid
         resetGeneration += 1
+        pairingFailure = nil
         message = nil
     }
 
     func importPhoto(_ data: Data) throws {
         photo = try store.savePhoto(data)
+        pairingFailure = nil
         message = nil
     }
 
@@ -477,6 +498,7 @@ final class PadModel: ObservableObject {
         do {
             try store.removePhoto()
             photo = nil
+            clearPairingFailure()
         } catch { message = "Could not remove the photo: \(error.localizedDescription)" }
     }
 
@@ -509,15 +531,13 @@ final class PadModel: ObservableObject {
             if case .tick = input, case .connecting = stateBefore, let attempt {
                 // Attempt timeout: the transport did not come up on this path.
                 preferences.peerToPeer.attemptFailed(usedP2P: attempt.usedP2P)
-                if attempt.pairing != nil { message = Self.pairingFailedMessage }
             }
+            reportEndedPairingAttempt(input: input)
             retireAttempt(goodbye: nil)
         case .sendHello:
             sendHello()
         case .closeLink(let goodbye):
-            if case .tick = input, case .awaitingWelcome = stateBefore, attempt?.pairing != nil {
-                message = Self.pairingFailedMessage
-            }
+            reportEndedPairingAttempt(input: input)
             retireAttempt(goodbye: goodbye)
         case .releaseHeldInput:
             sendReleaseAll()
@@ -633,20 +653,27 @@ final class PadModel: ObservableObject {
         old.connection.pathUpdateHandler = nil
         let time = now
         if case .goodbye(let r) = reason {
-            handle(.linkClosed(r))
+            // A Mac that refuses a pasted key before its welcome leaves a message: the supervisor may
+            // now reconnect the previously paired Mac.
+            if !old.welcomed, old.pairing != nil { showPairingFailure(Self.pairingRefusedMessage(r)) }
+            // That refusal concerns the pasted-key Mac only: it must not park, hold or delete the stored
+            // pairing of another Mac (a goodbye(.unpaired) would delete it), so report a plain close.
+            handle(.linkClosed(speaksForStoredPairing(old) ? r : nil))
         } else if old.welcomed {
             handle(.linkClosed(nil))
         } else if let hello = old.helloSentAt, time - hello < Self.closedAfterHelloWindow {
-            if old.pairing != nil { message = "Update iKey on your Mac, then connect again." }
+            if old.pairing != nil { showPairingFailure("Update iKey on your Mac, then connect again.") }
             handle(.closedAfterHello)
         } else {
             let host = old.remoteHost
-            let knownGood = old.matchedByID || (host.map { record?.knownGoodHosts.contains($0) ?? false } ?? false)
+            // A pasted key failing proves nothing about the stored key: never count it toward needsRepair.
+            let knownGood = old.pairing == nil
+                && (old.matchedByID || (host.map { record?.knownGoodHosts.contains($0) ?? false } ?? false))
             let authFailure = Self.isAuthFailure(reason, connection: old.connection)
             // A TLS alert or PSK mismatch proves the path reached the Mac: it is not evidence
             // against infrastructure Wi-Fi, so it must not push the policy back to P2P.
             if !authFailure { preferences.peerToPeer.attemptFailed(usedP2P: old.usedP2P) }
-            if old.pairing != nil { message = Self.pairingFailedMessage }
+            if old.pairing != nil { showPairingFailure(Self.pairingFailedMessage) }
             handle(.attemptFailed(authFailure: authFailure, knownGoodHost: knownGood))
         }
     }
@@ -666,7 +693,8 @@ final class PadModel: ObservableObject {
             if p50 != rttP50 { rttP50 = p50 }
             if p95 != rttP95 { rttP95 = p95 }
         case .goodbye(let reason):
-            lastGoodbye = reason
+            // A pasted-key Mac's refusal is reported by closed(); it says nothing about the paired Mac.
+            if speaksForStoredPairing(link) { lastGoodbye = reason }
         case .unknown:
             break
         }
@@ -680,7 +708,9 @@ final class PadModel: ObservableObject {
         macPrefs = w.prefs
         capsLockOn = w.caps
         lastGoodbye = nil
-        message = nil
+        // A reconnect of the previously paired Mac keeps a failed pairing's message on screen.
+        if link.pairing != nil { pairingFailure = nil }
+        message = pairingFailure
         latency = LatencyStats()
         rttP50 = nil
         rttP95 = nil
@@ -1000,6 +1030,63 @@ final class PadModel: ObservableObject {
         lastGoodbye == .protocolMismatch
             ? "Update iKey on this iPad, then connect again."
             : "Update iKey on \(macName ?? "your Mac"), then connect again."
+    }
+
+    private var pairedMacNeedsUpdateMessage: String {
+        "\(macName ?? "Your paired Mac") needs an iKey update. Update it, or Forget it to pair a different Mac."
+    }
+
+    /// False for a pasted-key attempt (with a key other than the stored one) that has not been
+    /// welcomed: what its Mac says or does must not change the stored pairing's state.
+    private func speaksForStoredPairing(_ link: LinkAttempt) -> Bool {
+        link.welcomed || link.pairing == nil || link.secret == pairedSecret
+    }
+
+    /// The supervisor is cancelling or closing the current attempt. A pasted-key attempt that ends
+    /// before its welcome, other than by the user's own Disconnect or Forget, leaves a message: the
+    /// one-shot key is gone and the supervisor may now reconnect the previously paired Mac.
+    private func reportEndedPairingAttempt(input: LinkInput) {
+        guard let attempt, attempt.pairing != nil, !attempt.welcomed else { return }
+        switch input {
+        case .userDisconnect, .forgot:
+            return
+        case .peerAdvertised:
+            // The paired Mac now advertises protocol 1 and holds every attempt (not sticky, as in connect()).
+            message = pairedMacNeedsUpdateMessage
+        case .background:
+            showPairingFailure("Pairing was interrupted. Connect again to finish it.")
+        default:
+            showPairingFailure(Self.pairingFailedMessage)
+        }
+    }
+
+    private static func pairingRefusedMessage(_ reason: GoodbyeReason) -> String {
+        switch reason {
+        case .protocolMismatch: return "Update iKey on this iPad, then connect again."
+        case .unpaired: return "That Mac changed its pairing key. Paste the new key, then connect again."
+        case .receiverStopping: return "iKey stopped on that Mac before pairing finished. Start it, then connect again."
+        case .macSleeping: return "That Mac went to sleep before pairing finished. Wake it, then connect again."
+        case .background, .user, .replaced: return pairingFailedMessage
+        }
+    }
+
+    private func showPairingFailure(_ text: String) {
+        pairingFailure = text
+        message = text
+    }
+
+    /// The user acted after a failed pairing: its message has done its job.
+    private func clearPairingFailure() {
+        if let pairingFailure, message == pairingFailure { message = nil }
+        pairingFailure = nil
+    }
+
+    /// Inputs that only release state, safe to send after the deck has left `.live`.
+    private static func releasesState(_ input: PadInput) -> Bool {
+        switch input {
+        case .releaseAll, .key(code: _, down: false), .button(button: _, down: false, clickState: _): return true
+        case .key, .button, .motion, .scroll, .contacts, .gesture: return false
+        }
     }
 
     private static let pairingFailedMessage =
