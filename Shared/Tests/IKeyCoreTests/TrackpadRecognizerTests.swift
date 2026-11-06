@@ -639,6 +639,212 @@ final class TrackpadRecognizerTests: XCTestCase {
         XCTAssertTrue(scrollPhases(pad.log).contains(.began))
     }
 
+    /// Pointing, thumb tap, a second finger starts a scroll, and only then does
+    /// the thumb re-land inside the tap-hold window. When the scroll lifts the
+    /// thumb must not press, and later pointing must not drag.
+    func testThumbRelandingDuringScrollNeverPresses() {
+        var pad = Pad()
+        pad.down(1, 50, 40, at: 0)
+        pad.down(2, 64, 72, at: 0.05)
+        XCTAssertEqual(pad.up(2, at: 0.15), click(1))
+        XCTAssertEqual(pad.down(3, 70, 40, at: 0.2), [.contacts(2), mayBegin])
+        pad.glide([Path(1, from: (50, 40), to: (50, 45)), Path(3, from: (70, 40), to: (70, 45))], from: 0.2, to: 0.3)
+        XCTAssertTrue(scrollPhases(pad.log).contains(.began))
+        XCTAssertEqual(pad.down(2, 64, 72, at: 0.32), [], "the thumb rests; no tap-hold candidacy mid-scroll")
+        XCTAssertNil(pad.r.nextDeadline)
+        pad.glide([Path(1, from: (50, 45), to: (50, 50)), Path(3, from: (70, 45), to: (70, 50))], from: 0.32, to: 0.5)
+        pad.up(1, at: 0.55)
+        pad.up(3, at: 0.56)
+        XCTAssertNil(pad.r.nextDeadline)
+        XCTAssertEqual(pad.advance(1.0), [])
+        XCTAssertTrue(pad.r.heldButtons.isEmpty)
+        pad.down(4, 50, 40, at: 1.2)
+        let point = pad.glide([Path(4, from: (50, 40), to: (60, 40))], from: 1.2, to: 1.4)
+        XCTAssertEqual(buttons(point), [])
+        XCTAssertEqual(motionSum(point).x, 10, accuracy: 1e-6)
+        pad.up(4, at: 1.45)
+        XCTAssertEqual(pad.up(2, at: 2.0), [])
+        XCTAssertEqual(buttons(pad.log), click(1))
+    }
+
+    /// Thumb tap, a quick two-finger scroll, then the thumb re-lands while its
+    /// tap-hold window is still open: the scroll in between ends that window.
+    func testThumbTapThenScrollThenRelandNeverPresses() {
+        var pad = Pad()
+        pad.down(1, 64, 72, at: 0, size: .broad)
+        XCTAssertEqual(pad.up(1, at: 0.08), click(1))
+        pad.down(2, 50, 40, at: 0.1)
+        XCTAssertEqual(pad.down(3, 70, 40, at: 0.11), [.contacts(2), mayBegin])
+        pad.glide([Path(2, from: (50, 40), to: (50, 50)), Path(3, from: (70, 40), to: (70, 50))], from: 0.11, to: 0.25)
+        pad.up(2, at: 0.26)
+        pad.up(3, at: 0.27)
+        XCTAssertTrue(scrollPhases(pad.log).contains(.began))
+        XCTAssertEqual(pad.down(1, 64, 72, at: 0.3, size: .broad), [])
+        XCTAssertNil(pad.r.nextDeadline)
+        XCTAssertEqual(pad.advance(1.0), [])
+        pad.down(4, 50, 40, at: 1.1)
+        let point = pad.glide([Path(4, from: (50, 40), to: (60, 40))], from: 1.1, to: 1.3)
+        XCTAssertEqual(buttons(point), [])
+        XCTAssertEqual(motionSum(point).x, 10, accuracy: 1e-6)
+        pad.up(4, at: 1.35)
+        XCTAssertEqual(pad.up(1, at: 1.5), [])
+        XCTAssertEqual(buttons(pad.log), click(1))
+    }
+
+    /// A thumb tap made during a scroll opens no tap-hold window, even when the
+    /// thumb re-lands after the scroll ended and one finger lingers.
+    func testThumbTapDuringScrollOpensNoHoldWindow() {
+        var pad = Pad()
+        pad.down(1, 50, 40, at: 0)
+        XCTAssertEqual(pad.down(3, 70, 40, at: 0.02), [.contacts(2), mayBegin])
+        pad.glide([Path(1, from: (50, 40), to: (50, 48)), Path(3, from: (70, 40), to: (70, 48))], from: 0.02, to: 0.15)
+        pad.down(2, 64, 72, at: 0.16)
+        pad.up(2, at: 0.24)
+        pad.up(1, at: 0.3)
+        let mark = pad.log.count
+        XCTAssertEqual(pad.down(2, 64, 72, at: 0.32), [])
+        XCTAssertNil(pad.r.nextDeadline)
+        XCTAssertEqual(pad.advance(1.0), [])
+        pad.up(3, at: 1.1)
+        pad.down(4, 50, 40, at: 1.2)
+        pad.glide([Path(4, from: (50, 40), to: (60, 40))], from: 1.2, to: 1.4)
+        pad.up(4, at: 1.45)
+        pad.up(2, at: 1.5)
+        XCTAssertEqual(buttons(Array(pad.log[mark...])), [])
+        XCTAssertTrue(pad.r.heldButtons.isEmpty)
+    }
+
+    /// A thumb that lands during a scroll and lifts after the scroll fingers have
+    /// lifted (mode is idle again) still opens no tap-hold window.
+    func testThumbTapOverlappingScrollEndOpensNoHoldWindow() {
+        var pad = Pad()
+        pad.down(1, 50, 40, at: 0)
+        XCTAssertEqual(pad.down(3, 70, 40, at: 0.02), [.contacts(2), mayBegin])
+        pad.glide([Path(1, from: (50, 40), to: (50, 48)), Path(3, from: (70, 40), to: (70, 48))], from: 0.02, to: 0.15)
+        XCTAssertTrue(scrollPhases(pad.log).contains(.began))
+        pad.down(2, 64, 72, at: 0.16, size: .broad)
+        pad.up(1, at: 0.2)
+        pad.up(3, at: 0.21)
+        pad.up(2, at: 0.3)
+        let mark = pad.log.count
+        XCTAssertEqual(pad.down(2, 64, 72, at: 0.4, size: .broad), [])
+        XCTAssertNil(pad.r.nextDeadline)
+        XCTAssertEqual(pad.advance(1.0), [])
+        XCTAssertTrue(pad.r.heldButtons.isEmpty)
+        pad.down(4, 50, 40, at: 1.1)
+        let point = pad.glide([Path(4, from: (50, 40), to: (60, 40))], from: 1.1, to: 1.3)
+        XCTAssertEqual(buttons(point), [])
+        XCTAssertEqual(motionSum(point).x, 10, accuracy: 1e-6)
+        pad.up(4, at: 1.35)
+        XCTAssertEqual(pad.up(2, at: 1.5), [])
+        XCTAssertEqual(buttons(Array(pad.log[mark...])), [])
+        XCTAssertTrue(pad.r.heldButtons.isEmpty)
+    }
+
+    /// A thumb resting before a quick scroll, lifting after the scroll fingers:
+    /// its lift is no tap (no click) and opens no tap-hold window.
+    func testThumbRestingThroughScrollNeitherClicksNorOpensHoldWindow() {
+        var pad = Pad()
+        pad.down(2, 64, 72, at: 0, size: .broad)
+        pad.down(1, 50, 40, at: 0.01)
+        pad.down(3, 70, 40, at: 0.02)
+        pad.glide([Path(1, from: (50, 40), to: (50, 48)), Path(3, from: (70, 40), to: (70, 48))], from: 0.02, to: 0.12)
+        XCTAssertTrue(scrollPhases(pad.log).contains(.began))
+        pad.up(1, at: 0.15)
+        pad.up(3, at: 0.16)
+        XCTAssertEqual(buttons(pad.up(2, at: 0.2)), [], "a thumb resting through a scroll is no tap")
+        XCTAssertNil(pad.r.nextDeadline)
+        XCTAssertEqual(pad.down(2, 64, 72, at: 0.3, size: .broad), [])
+        XCTAssertNil(pad.r.nextDeadline)
+        XCTAssertEqual(pad.advance(1.0), [])
+        XCTAssertTrue(pad.r.heldButtons.isEmpty)
+        pad.down(4, 50, 40, at: 1.1)
+        let point = pad.glide([Path(4, from: (50, 40), to: (60, 40))], from: 1.1, to: 1.3)
+        XCTAssertEqual(buttons(point), [])
+        XCTAssertEqual(motionSum(point).x, 10, accuracy: 1e-6)
+        pad.up(4, at: 1.35)
+        pad.up(2, at: 1.5)
+        XCTAssertEqual(buttons(pad.log), [])
+    }
+
+    /// A thumb that lands during a three-finger swipe and lifts after the
+    /// fingers opens no tap-hold window.
+    func testThumbTapOverlappingSwipeEndOpensNoHoldWindow() {
+        var pad = Pad()
+        pad.down(1, 40, 40, at: 0)
+        pad.down(3, 55, 40, at: 0.01)
+        pad.down(4, 70, 40, at: 0.02)
+        pad.down(2, 64, 72, at: 0.05, size: .broad)
+        pad.glide([Path(1, from: (40, 40), to: (65, 40)), Path(3, from: (55, 40), to: (80, 40)),
+                   Path(4, from: (70, 40), to: (95, 40))], from: 0.05, to: 0.15)
+        XCTAssertEqual(gestures(pad.log), [.swipe(fingers: 3, direction: .right)])
+        pad.up(1, at: 0.16)
+        pad.up(3, at: 0.17)
+        pad.up(4, at: 0.18)
+        pad.up(2, at: 0.25)
+        let mark = pad.log.count
+        XCTAssertEqual(pad.down(2, 64, 72, at: 0.3, size: .broad), [])
+        XCTAssertNil(pad.r.nextDeadline)
+        XCTAssertEqual(pad.advance(1.0), [])
+        XCTAssertTrue(pad.r.heldButtons.isEmpty)
+        pad.down(5, 50, 40, at: 1.1)
+        let point = pad.glide([Path(5, from: (50, 40), to: (60, 40))], from: 1.1, to: 1.3)
+        XCTAssertEqual(buttons(point), [])
+        XCTAssertEqual(motionSum(point).x, 10, accuracy: 1e-6)
+        pad.up(5, at: 1.35)
+        pad.up(2, at: 1.5)
+        XCTAssertEqual(buttons(Array(pad.log[mark...])), [])
+        XCTAssertTrue(pad.r.heldButtons.isEmpty)
+    }
+
+    /// Thumb tap-hold orderings around a three-finger gesture never press.
+    func testThumbHoldCandidateNeverSurvivesThreeFingerGesture() {
+        // The thumb re-lands while three fingers are down.
+        var during = Pad()
+        during.down(1, 64, 72, at: 0, size: .broad)
+        XCTAssertEqual(during.up(1, at: 0.08), click(1))
+        during.down(2, 50, 40, at: 0.1)
+        during.down(3, 64, 40, at: 0.11)
+        during.down(4, 78, 40, at: 0.12)
+        XCTAssertEqual(during.down(1, 64, 72, at: 0.2, size: .broad), [])
+        XCTAssertNil(during.r.nextDeadline)
+        during.glide([Path(2, from: (50, 40), to: (50, 41)), Path(3, from: (64, 40), to: (64, 41)),
+                      Path(4, from: (78, 40), to: (78, 41))], from: 0.2, to: 0.3)
+        during.up(2, at: 0.35)
+        during.up(3, at: 0.36)
+        during.up(4, at: 0.37)
+        XCTAssertNil(during.r.nextDeadline)
+        XCTAssertEqual(during.advance(1.0), [])
+        during.down(5, 50, 40, at: 1.1)
+        let point = during.glide([Path(5, from: (50, 40), to: (60, 40))], from: 1.1, to: 1.3)
+        XCTAssertEqual(buttons(point), [])
+        XCTAssertEqual(motionSum(point).x, 10, accuracy: 1e-6)
+        during.up(5, at: 1.35)
+        XCTAssertEqual(during.up(1, at: 1.5), [])
+        XCTAssertEqual(buttons(during.log), click(1))
+
+        // The candidate already rests when three fingers land.
+        var before = Pad()
+        before.down(1, 64, 72, at: 0, size: .broad)
+        before.up(1, at: 0.08)
+        XCTAssertEqual(before.down(1, 64, 72, at: 0.15, size: .broad), [])
+        XCTAssertNotNil(before.r.nextDeadline)
+        before.down(2, 50, 40, at: 0.2)
+        before.down(3, 64, 40, at: 0.21)
+        before.down(4, 78, 40, at: 0.22)
+        XCTAssertNil(before.r.nextDeadline)
+        before.up(2, at: 0.3)
+        before.up(3, at: 0.31)
+        before.up(4, at: 0.32)
+        XCTAssertNil(before.r.nextDeadline)
+        XCTAssertEqual(before.advance(1.0), [])
+        before.down(5, 50, 40, at: 1.1)
+        XCTAssertEqual(buttons(before.glide([Path(5, from: (50, 40), to: (60, 40))], from: 1.1, to: 1.3)), [])
+        before.up(5, at: 1.35)
+        before.up(1, at: 1.5)
+        XCTAssertEqual(buttons(before.log), click(1))
+    }
+
     func testThumbHoldWaitsDespiteThumbTravel() {
         var pad = Pad()
         pad.down(1, 64, 72, at: 0, size: .broad)

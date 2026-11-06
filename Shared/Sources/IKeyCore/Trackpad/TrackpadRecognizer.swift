@@ -75,6 +75,10 @@ public struct TrackpadRecognizer {
         var buffered = Vec.zero
         /// Where a button-holding thumb was when it became the only contact.
         var soleAnchor: Vec?
+        /// Overlapped a scroll or gesture: its tap may never open a thumb tap-hold window.
+        var sawGesture = false
+        /// Was already down when a scroll or gesture began: its lift is no tap.
+        var predatesGesture = false
         var drives = false
         var velocity = VelocityEstimator()
 
@@ -353,6 +357,14 @@ public struct TrackpadRecognizer {
     /// Every counted finger, inert ones included; this is what `.contacts` reports.
     private var touchingFingerCount: Int { contacts.values.reduce(0) { $0 + ($1.role == .finger ? 1 : 0) } }
 
+    /// Two or more active fingers are scrolling or gesturing.
+    private var inGesture: Bool {
+        switch mode {
+        case .scroll, .multi: return true
+        case .idle, .pointer: return false
+        }
+    }
+
     private var tapDragEnabled: Bool { settings.dragStyle == .tapDrag || settings.dragStyle == .tapDragLock }
 
     /// Makes every counted finger inert; typing overrides lingering.
@@ -390,7 +402,9 @@ public struct TrackpadRecognizer {
             // Only a thumb-like contact can be a thumb tap-hold candidate; a lone
             // fingertip after a tap is a finger (a tap-drag candidate in the
             // tap-drag styles), so tap-then-point and tap-then-scroll keep working.
-            let nearThumbTap = thumbLike && settings.thumbClick && drag == nil && near(thumbWait)
+            // Never during a scroll or gesture: a hold candidacy there would press
+            // once the fingers lift and turn later pointing into a drag.
+            let nearThumbTap = thumbLike && settings.thumbClick && drag == nil && !inGesture && near(thumbWait)
             let nearTap = !thumbLike && fingers.isEmpty && drag == nil && tapDragEnabled &&
                 (near(tapWait) || near(thumbWait))
 
@@ -424,6 +438,7 @@ public struct TrackpadRecognizer {
             }
             if c.role == .finger { reviveLingering(now) }
         }
+        c.sawGesture = inGesture
         contacts[id] = c
     }
 
@@ -504,6 +519,7 @@ public struct TrackpadRecognizer {
             if drag == .threeFinger, releaseAt != nil {
                 // Fingers re-landed before the three-finger drag released.
                 releaseAt = nil
+                abandonThumbHold()
                 mode = .multi(MultiState(start: now, lastEmit: now, fingers: new, dragging: true, allowDrag: false))
             } else {
                 mode = .pointer
@@ -532,9 +548,7 @@ public struct TrackpadRecognizer {
     }
 
     private mutating func enterGesture(fingers: Int, _ now: TimeInterval, _ out: inout [TrackpadOutput]) {
-        // A pending thumb tap-hold belongs to one-finger pointing; it must not
-        // press the button in the middle of a scroll or gesture.
-        for (id, c) in contacts where c.thumbHoldCandidate { clearCandidacy(id) }
+        abandonThumbHold()
         if fingers == 2 {
             let ids = fingerIDs
             let span = ids.count == 2 ? (contacts[ids[0]]?.last ?? .zero).distance(to: contacts[ids[1]]?.last ?? .zero) : 0
@@ -548,6 +562,21 @@ public struct TrackpadRecognizer {
             for id in fingerIDs { m.anchors[id] = contacts[id]?.last }
             m.velocity.add(x: 0, y: 0, at: now)
             mode = .multi(m)
+        }
+    }
+
+    /// A thumb tap-hold belongs to one-finger pointing: a scroll or gesture ends
+    /// the pending candidacy and the window a thumb tap opened, so neither can
+    /// press the button later (when the fingers lift, mode returns to `.idle`
+    /// and a stale candidate's deadline would already be due). Every contact down
+    /// now is marked, so a thumb that lifts after the fingers (when the mode is
+    /// `.idle` again) cannot open a window either.
+    private mutating func abandonThumbHold() {
+        thumbWait = nil
+        for (id, c) in contacts {
+            if c.thumbHoldCandidate { clearCandidacy(id) }
+            contacts[id]?.sawGesture = true
+            contacts[id]?.predatesGesture = true
         }
     }
 
@@ -651,15 +680,18 @@ public struct TrackpadRecognizer {
             release(&out)
             return
         }
-        guard allowTap, settings.thumbClick, now - c.beganAt < Self.thumbTapMax, c.maxTravel < Self.thumbTapSlop,
-              quiet(since: c.beganAt) else { return }
+        // A thumb resting when a scroll or gesture began was part of that touch, not a tap.
+        guard allowTap, settings.thumbClick, !c.predatesGesture, now - c.beganAt < Self.thumbTapMax,
+              c.maxTravel < Self.thumbTapSlop, quiet(since: c.beganAt) else { return }
         if drag == .tapDrag(nil), releaseAt == nil {
             release(&out)  // a tap ends a drag lock
             return
         }
         guard drag == nil else { return }
         click(now, touchDown: c.beganAt, &out)
-        thumbWait = Wait(at: c.last, until: now + Self.thumbHoldDelay)
+        // A thumb tap that overlapped a scroll or gesture clicks but opens no
+        // tap-hold window, even when it lifts after the gesture's fingers.
+        if !inGesture, !c.sawGesture { thumbWait = Wait(at: c.last, until: now + Self.thumbHoldDelay) }
     }
 
     // MARK: - Motion

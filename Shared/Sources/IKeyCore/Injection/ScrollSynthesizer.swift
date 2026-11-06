@@ -51,6 +51,13 @@ public struct ScrollSynthesizer: Sendable {
     /// Momentum ends once it slows below this (points/s).
     private static let momentumStopSpeed = 1.0
     private static let tickInterval = 1.0 / 120
+    /// A lift more than this far (s) from the gesture's last scroll input, or at a
+    /// time that cannot carry 1/120 s ticks, starts no momentum: the timestamp is
+    /// stale or on another clock, and a glide from it could never be ticked.
+    private static let momentumMaxReleaseGap = 0.5
+    /// A tick this far (s) before the last one means the clock is inconsistent: the
+    /// glide ends instead of waiting for time to catch up.
+    private static let momentumMaxClockRewind = 1.0
 
     public var natural: Bool
     public var basePtPerMM: Double
@@ -61,6 +68,7 @@ public struct ScrollSynthesizer: Sendable {
     private var gesture = Gesture.idle
     private var glide: Glide?
     private var remainderX = 0.0, remainderY = 0.0
+    private var lastScrollInput: TimeInterval?
 
     public init(natural: Bool = true, basePtPerMM: Double = 5.0, speedFactor: Double = 1.0, scrollIndex: Double = 0.6875,
                 maxBoost: Double = 8, curves: [HIDAccelCurve] = HIDCurveTables.scroll) {
@@ -95,6 +103,7 @@ public struct ScrollSynthesizer: Sendable {
                 frames += stopMomentum(at: now)
                 if gesture == .idle { beginGesture() }
             }
+            if now.isFinite { lastScrollInput = now }
             let dx = Self.finite(dxMM), dy = Self.finite(dyMM)
             guard dx != 0 || dy != 0 else { return frames }
             let v = speed.isFinite && speed >= 0 ? speed : (dt > 0 ? (dx * dx + dy * dy).squareRoot() / dt : 0)
@@ -133,7 +142,13 @@ public struct ScrollSynthesizer: Sendable {
 
     /// Advances momentum to `now`; call at `nextDeadline`.
     public mutating func tick(at now: TimeInterval) -> [ScrollFrame] {
-        guard var g = glide, now > g.lastTick else { return [] }
+        guard var g = glide else { return [] }
+        // A non-finite or rewound clock can never advance the glide: end it.
+        guard now.isFinite, now >= g.lastTick - Self.momentumMaxClockRewind else {
+            glide = nil
+            return g.begun ? [ScrollFrame(momentum: Momentum.end)] : []
+        }
+        guard now > g.lastTick else { return [] }
         let dt = now - g.lastTick
         let decay = pow(g.alpha, dt / 0.008)
         g.vx *= decay
@@ -174,23 +189,44 @@ public struct ScrollSynthesizer: Sendable {
     private mutating func beginGesture() {
         remainderX = 0
         remainderY = 0
+        lastScrollInput = nil
     }
 
     private mutating func startMomentum(releaseVX: Double?, releaseVY: Double?, at now: TimeInterval) {
-        var rx = Self.finite(releaseVX ?? 0), ry = Self.finite(releaseVY ?? 0)
+        // The first deadline (now + 1/120) must be finite and later than now, or no
+        // tick could ever advance or end the glide.
+        guard now.isFinite, now + Self.tickInterval > now else { return }
+        if let last = lastScrollInput, abs(now - last) > Self.momentumMaxReleaseGap { return }
+        let (rx, ry, release) = Self.clampedRelease(releaseVX ?? 0, releaseVY ?? 0)
         let scale = basePtPerMM * speedFactor
-        // hypot avoids overflow for huge components.
-        let release = hypot(rx, ry)
         guard release >= Self.momentumMinRelease, scale.isFinite, scale > 0 else { return }
-        if release > Self.momentumMaxRelease {
-            rx *= Self.momentumMaxRelease / release
-            ry *= Self.momentumMaxRelease / release
-        }
         let vx = rx * scale * sign, vy = ry * scale * sign
         let v0 = (vx * vx + vy * vy).squareRoot()
         guard v0.isFinite else { return }
         let alpha = 0.975 - 0.065 * max(0, (250 - v0) / 250)
         glide = Glide(vx: vx, vy: vy, alpha: alpha, lastTick: now)
+    }
+
+    /// The release velocity (mm/s) and its speed, clamped to `momentumMaxRelease`
+    /// keeping its direction. A NaN component counts as 0; infinite components set the
+    /// direction (the finite one then counts as 0) and clamp to the cap. Components
+    /// are normalised first, so a speed that overflows still clamps instead of
+    /// collapsing to zero.
+    private static func clampedRelease(_ vx: Double, _ vy: Double) -> (x: Double, y: Double, speed: Double) {
+        var x = vx.isNaN ? 0 : vx, y = vy.isNaN ? 0 : vy
+        let infinite = x.isInfinite || y.isInfinite
+        if infinite {
+            x = x.isInfinite ? (x > 0 ? 1 : -1) : 0
+            y = y.isInfinite ? (y > 0 ? 1 : -1) : 0
+        }
+        let m = max(abs(x), abs(y))
+        guard m > 0 else { return (0, 0, 0) }
+        let ux = x / m, uy = y / m
+        let n = hypot(ux, uy)  // 1...√2
+        let speed = m * n      // +inf when the true speed overflows
+        guard infinite || speed > momentumMaxRelease else { return (x, y, speed) }
+        let k = momentumMaxRelease / n
+        return (ux * k, uy * k, momentumMaxRelease)
     }
 
     /// Speed-dependent gain from the scroll curve, relative to its linear slope.

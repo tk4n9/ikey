@@ -270,7 +270,7 @@ final class ScrollSynthesizerTests: XCTestCase {
     }
 
     /// A release-velocity spike is clamped (keeping its direction), so momentum stays
-    /// bounded and always ends; an infinite one never starts it.
+    /// bounded and always ends.
     func testExtremeReleaseIsClampedAndEnds() {
         var reference = ScrollSynthesizer()
         _ = flick(&reference, release: 3000)
@@ -286,14 +286,114 @@ final class ScrollSynthesizerTests: XCTestCase {
             XCTAssertLessThanOrEqual(abs(abs(distance) - cap), 1, "release \(release)")
             XCTAssertEqual(glide.last?.momentum, 3)
         }
-        var infinite = ScrollSynthesizer()
-        _ = move(&infinite, .began, dy: 2, at: 0)
-        _ = lift(&infinite, vx: .infinity, vy: .nan, at: 0.1)
-        XCTAssertFalse(infinite.isMomentumActive)
         // Unbounded settings never leave momentum running.
         var broken = ScrollSynthesizer(basePtPerMM: .infinity)
         _ = flick(&broken, release: 300)
         XCTAssertFalse(broken.isMomentumActive)
+    }
+
+    /// Lifts one finger-scroll at velocity (vx, vy) mm/s and drains the glide; returns
+    /// the total momentum points per axis and whether momentum started.
+    private func glide(vx: Double, vy: Double) -> (x: Int, y: Int, started: Bool) {
+        var s = ScrollSynthesizer()
+        _ = move(&s, .began, dx: 1, dy: 1, at: 0)
+        _ = lift(&s, vx: vx, vy: vy, at: 0.05)
+        let started = s.isMomentumActive
+        let frames = drain(&s, limit: 2000)
+        XCTAssertTrue(frames.isEmpty || frames.last?.momentum == 3)
+        return (frames.reduce(0) { $0 + Int($1.pointX) }, frames.reduce(0) { $0 + Int($1.pointY) }, started)
+    }
+
+    /// A release whose magnitude overflows, or with infinite components, clamps to the
+    /// 3000 mm/s cap keeping its direction; a NaN component counts as 0.
+    func testOverflowingReleaseClampsKeepingDirection() {
+        let c = 3000 / 2.0.squareRoot()
+        let diagonal = glide(vx: c, vy: c)
+        XCTAssertGreaterThan(diagonal.x, 0)
+        XCTAssertEqual(diagonal.x, diagonal.y, accuracy: 1)
+        let right = glide(vx: 3000, vy: 0)
+        let left = glide(vx: -3000, vy: 0)
+        XCTAssertGreaterThan(right.x, 0)
+        XCTAssertLessThan(left.x, 0)
+
+        func check(_ vx: Double, _ vy: Double, _ expected: (x: Int, y: Int, started: Bool), line: UInt = #line) {
+            let g = glide(vx: vx, vy: vy)
+            XCTAssertTrue(g.started, "(\(vx), \(vy))", line: line)
+            XCTAssertEqual(g.x, expected.x, accuracy: 1, "(\(vx), \(vy))", line: line)
+            XCTAssertEqual(g.y, expected.y, accuracy: 1, "(\(vx), \(vy))", line: line)
+        }
+        check(1e308, 1e308, diagonal)                                   // hypot overflows
+        check(-1e308, -1e308, (-diagonal.x, -diagonal.y, true))
+        check(.infinity, .infinity, diagonal)
+        check(.infinity, .nan, right)
+        check(.infinity, 5, right)                                      // finite part is dropped
+        check(-.infinity, 0, left)
+        check(1e308, .nan, right)
+
+        XCTAssertFalse(glide(vx: .nan, vy: .nan).started)
+        XCTAssertFalse(glide(vx: .nan, vy: 10).started)                 // below 20 mm/s
+    }
+
+    /// A lift at a non-finite, unrepresentable or stale time starts no momentum, so
+    /// nextDeadline is never NaN, infinite or unreachable.
+    func testUnusableReleaseTimeStartsNoMomentum() {
+        for t in [Double.nan, Double.infinity, -Double.infinity, 1e300, -1e300, 1e20, 0.6, -0.6] {
+            var s = ScrollSynthesizer()
+            _ = move(&s, .began, dy: 2, at: 0)
+            XCTAssertEqual(lift(&s, vy: 500, at: t), [ScrollFrame(phase: 4)], "lift at \(t)")
+            XCTAssertFalse(s.isMomentumActive, "lift at \(t)")
+            XCTAssertNil(s.nextDeadline, "lift at \(t)")
+        }
+        // Within the gap (finger still for 0.5 s at most) the glide still starts.
+        var s = ScrollSynthesizer()
+        _ = move(&s, .began, dy: 2, at: 0)
+        _ = lift(&s, vy: 500, at: 0.5)
+        XCTAssertEqual(s.nextDeadline ?? 0, 0.5 + 1.0 / 120, accuracy: 1e-12)
+
+        // Without a finite input time, only the release time itself is checked.
+        var unanchored = ScrollSynthesizer()
+        _ = move(&unanchored, .began, dy: 2, at: .nan)
+        _ = lift(&unanchored, vy: 500, at: 1e300)
+        XCTAssertFalse(unanchored.isMomentumActive)
+        _ = move(&unanchored, .began, dy: 2, at: .nan)
+        _ = lift(&unanchored, vy: 500, at: 7)
+        XCTAssertTrue(unanchored.isMomentumActive)
+        XCTAssertFalse(drain(&unanchored).isEmpty)
+    }
+
+    /// A tick at a non-finite or rewound clock ends the glide instead of leaving it
+    /// active forever; a small rewind (an early timer) is ignored.
+    func testBadTickClockEndsMomentum() {
+        var s = ScrollSynthesizer()
+        _ = flick(&s, release: 500)
+        let first = s.nextDeadline!
+        XCTAssertEqual(s.tick(at: first).map(\.momentum), [1])
+        XCTAssertEqual(s.tick(at: first - 0.5), [])
+        XCTAssertTrue(s.isMomentumActive)
+        XCTAssertEqual(s.tick(at: s.nextDeadline!).map(\.momentum), [2])
+        XCTAssertEqual(s.tick(at: .nan), [ScrollFrame(momentum: 3)])
+        XCTAssertFalse(s.isMomentumActive)
+        XCTAssertNil(s.nextDeadline)
+
+        var rewound = ScrollSynthesizer()
+        _ = flick(&rewound, release: 500)
+        _ = rewound.tick(at: rewound.nextDeadline!)
+        XCTAssertEqual(rewound.tick(at: -100), [ScrollFrame(momentum: 3)])
+        XCTAssertFalse(rewound.isMomentumActive)
+
+        // Before the Begin frame, ending emits nothing.
+        for t in [Double.infinity, -Double.infinity, -5] {
+            var fresh = ScrollSynthesizer()
+            _ = flick(&fresh, release: 500)
+            XCTAssertEqual(fresh.tick(at: t), [], "tick at \(t)")
+            XCTAssertFalse(fresh.isMomentumActive, "tick at \(t)")
+        }
+        // A far-future tick decays the glide to nothing and ends it.
+        var future = ScrollSynthesizer()
+        _ = flick(&future, release: 500)
+        _ = future.tick(at: future.nextDeadline!)
+        XCTAssertEqual(future.tick(at: 1e300), [ScrollFrame(momentum: 3)])
+        XCTAssertFalse(future.isMomentumActive)
     }
 
     /// Only the sub-pixel part carries over: a delta beyond Int32 is clamped once and
