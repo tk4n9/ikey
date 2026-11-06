@@ -44,7 +44,20 @@ final class EventInjector {
     /// not act on a partial remap (the first MacState.tapOnly, amendment H) checks
     /// `hasReadKeyRemap` in the callback.
     var onKeyRemapChanged: ((KeyRemap) -> Void)?
+    /// Additive (amendment K): true after the system Caps Lock could not be set and verified in
+    /// `.switchesInputSource` mode, so a long press cannot toggle Caps Lock while taps still
+    /// switch the input source. Cleared by a later successful set and by a new Caps Lock
+    /// preference.
+    private(set) var capsHardwareSetFailed = false
+    /// Additive (final-review fix): true after an input-source switch to a source that cannot
+    /// type ASCII (Korean 2-Set, Pinyin, Kana) had to use TISSelectInputSource because the
+    /// 'Select the previous input source' shortcut is off or unassigned. macOS may then show
+    /// the new source in the menu bar while the focused app keeps the old one, so the menu
+    /// asks for the shortcut. Cleared when the shortcut is enabled again.
+    private(set) var inputSourceShortcutNeeded = false
 
+    /// Symbolic hot key 60, 'Select the previous input source' (^Space by default).
+    private static let previousInputSourceHotKey = 60
     /// Every posted event carries this in kCGEventSourceUserData ("iKey").
     private static let userData: Int64 = 0x694B6579
     private static let log = Logger(subsystem: "com.ikey.mac", category: "injector")
@@ -115,9 +128,16 @@ final class EventInjector {
     /// Also the only remap-read trigger (amendment J): ReceiverModel calls this at start and on
     /// each preferences poll while listening.
     func apply(readings: MacReadings) {
+        setReadings(readings)
+        refreshKeyRemap()
+    }
+
+    /// Additive (amendment K): hands over the Mac's readings without starting a remap read, so
+    /// the Caps Lock mode, the fn-tap action and the hot keys (top-row Try) follow the Mac
+    /// before listening starts while idle still spawns no hidutil.
+    func setReadings(_ readings: MacReadings) {
         self.readings = readings
         rebuildSettings()
-        refreshKeyRemap()
     }
 
     func setTuning(gainScale: Double, scrollSpeedFactor: Double) {
@@ -134,7 +154,10 @@ final class EventInjector {
     /// nil = automatic from the readings. A new preference retries the hardware lock after a
     /// fallback to virtual mode.
     func setCapsModePreference(_ mode: CapsMode?) {
-        if mode != capsModePreference { capsHardwareFailed = false }
+        if mode != capsModePreference {
+            capsHardwareFailed = false
+            capsHardwareSetFailed = false
+        }
         capsModePreference = mode
         rebuildSettings()
     }
@@ -177,9 +200,16 @@ final class EventInjector {
         let automaticFnTap: FnTapAction = multipleSources ? .changeInputSource : FnTapAction.none
         s.fnTapAction = fnTapPreference ?? readings?.fnTapAction ?? automaticFnTap
         s.keyRemap = keyRemap.map
+        if inputSourceShortcutNeeded, s.hotKeys.hotKey(Self.previousInputSourceHotKey)?.enabled == true {
+            inputSourceShortcutNeeded = false
+        }
         guard s != settings else { return }
-        // A mode change resets the core's Caps Lock controller, including its virtual lock.
-        if s.capsMode != settings.capsMode { virtualCapsOn = false }
+        // A mode change resets the core's Caps Lock controller, including its virtual lock, and
+        // ends a long-press failure episode (the next hold tries the hardware lock again).
+        if s.capsMode != settings.capsMode {
+            virtualCapsOn = false
+            capsHardwareSetFailed = false
+        }
         settings = s
         core.update(settings: s)
         didCallCore()
@@ -307,8 +337,29 @@ final class EventInjector {
             if result == kIOReturnSuccess { userActivityAssertion = id }
 
         case let .selectPreviousInputSource(fallback):
-            if !inputSources.selectPrevious() { post(fallback) }
+            selectPreviousInputSource(fallback: fallback)
         }
+    }
+
+    /// The enabled 'Select the previous input source' shortcut goes first, TISSelectInputSource
+    /// only when it is off or unassigned (`fallback` empty). Posted like a keystroke, the
+    /// shortcut makes macOS switch the frontmost app's input context, CJKV input methods
+    /// included. TISSelectInputSource from iKey, a background agent that is never frontmost,
+    /// can return noErr and change the menu-bar icon while the focused app keeps typing with
+    /// the old source when the target is a CJKV input method such as Korean 2-Set (the macOS
+    /// bug macism and im-select work around). Nothing can detect that, so the shortcut must
+    /// not wait for a TIS error. `fallback` already lifts and re-presses held modifiers around
+    /// the chord, so held keys do not change the shortcut. This deliberately reverses the
+    /// 'TIS first' order of amendments C/I (final-review fix, pending lead sign-off).
+    private func selectPreviousInputSource(fallback: [SynthEvent]) {
+        guard fallback.isEmpty else {
+            post(fallback)
+            return
+        }
+        guard let target = inputSources.selectPrevious() else { return }
+        guard !target.asciiCapable, !inputSourceShortcutNeeded else { return }
+        inputSourceShortcutNeeded = true
+        Self.log.error("Switched to \(target.id, privacy: .public) with TISSelectInputSource because the 'Select the previous input source' shortcut is off; the focused app may keep the old source")
     }
 
     private func postKey(_ code: UInt16, down: Bool, flags: ModifierFlags, autorepeat: Bool, flagsChanged: Bool) {
@@ -359,12 +410,19 @@ final class EventInjector {
     /// Sets the system lock and verifies it. When that fails in `.system` mode, Caps Lock falls
     /// back to the virtual mode (the menu shows it). The press that failed is not replayed: the
     /// user presses Caps Lock again (accepted in the plan amendments). In
-    /// `.switchesInputSource` mode only this hold-to-toggle is dropped: the mode is kept so that
-    /// taps still switch the input source (they never need the hardware lock).
+    /// `.switchesInputSource` mode only this hold-to-toggle is dropped (`capsHardwareSetFailed`):
+    /// the mode is kept so that taps still switch the input source (they never need the
+    /// hardware lock).
     private func setCapsLock(_ on: Bool) {
-        guard !CapsLockHardware.set(on) else { return }
+        guard !CapsLockHardware.set(on) else {
+            capsHardwareSetFailed = false
+            return
+        }
         if settings.capsMode == .switchesInputSource {
-            Self.log.error("Caps Lock could not be set to \(on, privacy: .public); hold ignored, input-source switching kept")
+            if !capsHardwareSetFailed {
+                Self.log.error("Caps Lock could not be set to \(on, privacy: .public); hold ignored, input-source switching kept")
+            }
+            capsHardwareSetFailed = true
             return
         }
         guard !capsHardwareFailed else { return }
@@ -445,7 +503,8 @@ final class EventInjector {
 // MARK: - Input source switching
 
 /// Selects the previously selected keyboard input source, as Caps Lock (with 'Use Caps Lock to
-/// switch to and from ABC/last used') and a Globe tap set to 'Change Input Source' do. The
+/// switch to and from ABC/last used') and a Globe tap set to 'Change Input Source' do, while the
+/// 'Select the previous input source' shortcut is off (otherwise the injector posts it). The
 /// history is kept from the system's selection-change notifications, delivered immediately even
 /// while iKey (a menu-bar agent that is almost never active) is inactive. Main-queue confined.
 private final class InputSourceHistory: NSObject {
@@ -484,14 +543,21 @@ private final class InputSourceHistory: NSObject {
         }
     }
 
+    /// What `selectPrevious` selected.
+    struct Selection {
+        let id: String
+        /// False for sources such as Korean 2-Set or Japanese Kana that cannot type ASCII.
+        let asciiCapable: Bool
+    }
+
     /// Selects the previous source. Without a usable history: with exactly two selectable
     /// sources, the other one; with more, "to and from ABC" (from a non-ASCII source to ABC or
     /// another ASCII layout, otherwise to the last seen non-ASCII source, else the first one).
-    /// False when there is no target or TIS refuses the selection (the caller then posts the
-    /// shortcut chord instead).
-    func selectPrevious() -> Bool {
+    /// nil when there is no target or TIS refuses the selection. Used only while the 'Select
+    /// the previous input source' shortcut is off (see `EventInjector.selectPreviousInputSource`).
+    func selectPrevious() -> Selection? {
         noteCurrent()
-        guard let currentID = current else { return false }
+        guard let currentID = current else { return nil }
         let sources = Self.selectableSources()
         var target = sources.first { $0.id == previous && $0.id != currentID }
         if target == nil, let currentSource = sources.first(where: { $0.id == currentID }) {
@@ -501,11 +567,11 @@ private final class InputSourceHistory: NSObject {
                 target = asciiToggleTarget(from: currentSource, in: sources)
             }
         }
-        guard let target, TISSelectInputSource(target.ref) == OSStatus(noErr) else { return false }
+        guard let target, TISSelectInputSource(target.ref) == OSStatus(noErr) else { return nil }
         previous = currentID
         current = target.id
         if !target.asciiCapable { lastNonASCII = target.id }
-        return true
+        return Selection(id: target.id, asciiCapable: target.asciiCapable)
     }
 
     private func asciiToggleTarget(from currentSource: Source, in sources: [Source]) -> Source? {
@@ -576,9 +642,10 @@ private enum KeyRemapReader {
         var failed: [String]
     }
 
-    /// Reads every layer. A layer whose read fails (hidutil cannot run, times out or exits
-    /// non-zero; karabiner.json exists but cannot be read or parsed; the Modifier Keys data
-    /// cannot be serialised) keeps its `lastGood` pairs instead of counting as "no remap".
+    /// Reads every layer. A layer whose read fails (hidutil cannot run or times out, or its
+    /// system-wide query exits non-zero; karabiner.json exists but cannot be read or parsed;
+    /// the Modifier Keys data cannot be serialised) keeps its `lastGood` pairs instead of
+    /// counting as "no remap".
     /// Only a successful read that finds nothing (`(null)`, no file, no mappings) clears a layer.
     static func read(lastGood: Layers) -> ReadResult {
         var layers = lastGood
@@ -589,26 +656,57 @@ private enum KeyRemapReader {
         return ReadResult(layers: layers, failed: failed)
     }
 
-    /// `hidutil property --get UserKeyMapping`; nil when it cannot run, times out or fails.
+    /// The user's hidutil `UserKeyMapping` for the built-in keyboard; nil when it cannot be read.
+    /// hidutil keeps the property in two scopes: `--set` alone writes the event system's
+    /// (system-wide) property, while `--matching <service> --set` writes only the matching
+    /// services' property, which the system-wide `--get` does not show (it prints `(null)`).
+    /// LaunchAgent guides use both forms to remap only the internal keyboard, so both are read:
+    /// - `hidutil property --get UserKeyMapping` (system-wide);
+    /// - `hidutil property --matching '{"Built-In":true}' --get UserKeyMapping`, one row per
+    ///   built-in service (keyboard, trackpad, ...), each `(null)` or a mapping array.
+    ///   `parseHidutil` reads every `{...}` mapping block, so the rows merge.
+    /// Policy: the union of both, the built-in services' pair winning for a source key both
+    /// map (the narrower scope is the one the user aimed at the internal keyboard). When the
+    /// scoped read also reports a system-wide mapping, the union is unchanged.
+    /// The system-wide read must succeed (nil otherwise). For the scoped read, a timeout or
+    /// launch failure fails the layer (it keeps its last good pairs), but a non-zero exit
+    /// counts as no scoped mapping, so a hidutil that rejects the query (or finds no
+    /// built-in service) cannot pin the layer to stale pairs.
     private static func hidutil() -> [UInt16: UInt16]? {
+        // One budget for both runs, so the layer never takes longer than before.
+        let deadline = DispatchTime.now() + hidutilTimeout
+        guard let system = runHidutil(["property", "--get", "UserKeyMapping"], deadline: deadline),
+              system.status == 0 else { return nil }
+        guard let builtIn = runHidutil(["property", "--matching", #"{"Built-In":true}"#, "--get", "UserKeyMapping"],
+                                       deadline: deadline) else { return nil }
+        var pairs = KeyRemap.parseHidutil(system.output)
+        if builtIn.status == 0 {
+            pairs.merge(KeyRemap.parseHidutil(builtIn.output)) { _, scoped in scoped }
+        }
+        return pairs
+    }
+
+    /// Runs /usr/bin/hidutil; nil when it cannot launch or is still running at `deadline`
+    /// (it is then killed).
+    private static func runHidutil(_ arguments: [String], deadline: DispatchTime) -> (status: Int32, output: String)? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/hidutil")
-        process.arguments = ["property", "--get", "UserKeyMapping"]
+        process.arguments = arguments
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         let exited = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in exited.signal() }
         do { try process.run() } catch { return nil }
-        // The output is a few hundred bytes, well within the pipe buffer, so it is read after
-        // the exit; a child that hangs (or blocks on a full pipe) is killed at the timeout.
-        guard exited.wait(timeout: .now() + hidutilTimeout) == .success else {
+        // The output is at most a few kilobytes (one row per built-in service), well within the
+        // pipe buffer, so it is read after the exit; a child that hangs (or blocks on a full
+        // pipe) is killed at the deadline.
+        guard exited.wait(timeout: deadline) == .success else {
             process.terminate()
             return nil
         }
-        guard process.terminationStatus == 0 else { return nil }
         let output = pipe.fileHandleForReading.readDataToEndOfFile()
-        return KeyRemap.parseHidutil(String(decoding: output, as: UTF8.self))
+        return (process.terminationStatus, String(decoding: output, as: UTF8.self))
     }
 
     /// System Settings > Keyboard > Modifier Keys for the built-in keyboard (ByHost globals);

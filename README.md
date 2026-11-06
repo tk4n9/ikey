@@ -62,7 +62,8 @@ pending.
   - See [protocol](docs/protocol.md).
 - **Persistent pairing.**
   - You paste the pairing key once. Both devices keep it in their Keychain
-    (device-only, never synced), as the user chose.
+    (device-only, never synced), as the user chose. If the Mac's key changes,
+    the pairing card returns; the panel's pairing section also takes a new key.
   - The copied key is hidden from clipboard history and cleared after pairing.
   - The iPad reconnects by itself after relaunches, Control Center, iPad lock
     and Mac sleep. The newest iPad wins.
@@ -70,8 +71,12 @@ pending.
     while in use and avoids App Nap.
 - **No chrome.**
   - While connected the iPad shows only the deck. Problems show as a ring on
-    the Touch ID key and a quiet hint above the function row.
+    the Touch ID key and a quiet hint: above the function row when there is
+    room, otherwise at the top of the right palm rest (as at the default
+    placement).
   - Hold Touch ID for 0.6 s to open settings, also while disconnected.
+    **Pause input** there keeps the connection but ignores the deck until you
+    hold Touch ID again or tap **Resume input**.
   - Edge swipes are deferred. A windowed or rotated iKey shows a scaled
     drawing and pauses input until it is full screen and in landscape again.
 - **CI.** GitHub Actions runs the shared tests and an Apple syntax parse on Linux,

@@ -83,8 +83,11 @@ travel only.
 `tapOnly` lists the deck modifier keys that the Mac's key remap turns into
 something other than a modifier, for example `[55]` when left Command is mapped
 to Caps Lock. The iPad types those keys as taps only (see
-[touch behavior](touch-behavior.md#tap-only-keys)). The Mac sends `tapOnly` in
-every `state`, including the one right after `welcome`; `[]` clears the set.
+[touch behavior](touch-behavior.md#tap-only-keys)). `tapOnly` is optional:
+absent leaves the iPad's set unchanged, and `[]` clears it. The Mac omits it
+until its first key-remap read has finished (so the iPad keeps the set it saved
+for that Mac), then sends it in every `state`, including the one right after
+`welcome`.
 
 Features (`WireFeature.all`, sent by both sides): `macRepeat`, `mmMotion`,
 `scrollPhases`, `gestures`, `capsSync`, `clickState`.
@@ -232,11 +235,13 @@ device-only and never synced:
   decoded offers **Retry** or **New Key**.
 - **iPad:** one item per Mac (service `com.ikey.pairing.v2`, account = Mac UUID),
   with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and not synchronizable.
-  It is saved only after the first `welcome` with a pasted key.
+  It is saved only after the first `welcome` with a pasted key. The iPad's
+  pairing fields set no password content type, so the key is never offered to
+  Passwords or iCloud Keychain AutoFill.
 - The key changes only when the user chooses **New Key** on the Mac. Paired iPads
   then get `bye(unpaired)` and must be paired again.
 
-Pasteboard hardening on the Mac: **Copy** writes the key with the
+Pasteboard hardening on the Mac: **Copy Pairing Key** writes the key with the
 `org.nspasteboard.ConcealedType` and `org.nspasteboard.TransientType` markers,
 so clipboard managers skip it. It is cleared when the next iPad session is
 promoted, after 60 s, on **New Key** and when iKey quits, but only if nothing

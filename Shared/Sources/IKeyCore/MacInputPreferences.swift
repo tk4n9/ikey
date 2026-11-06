@@ -21,6 +21,9 @@ public struct MacInputPreferences: Codable, Equatable, Sendable {
     public var dragLock = false
     public var tapToClick = true
     public var threeFingerSwipes = true
+    /// System Settings > Trackpad > More Gestures > App Exposé (com.apple.dock
+    /// showAppExposeGestureEnabled): a swipe down shows the app's windows. Off on a new Mac.
+    public var appExposeGesture = false
 
     public init() {}
 
@@ -28,7 +31,7 @@ public struct MacInputPreferences: Codable, Equatable, Sendable {
                 naturalScrolling: Bool = true, trackingIndex: Double = 0.6875,
                 fnKeysStandard: Bool = false, doubleClickInterval: Double = 0.5,
                 threeFingerDrag: Bool = false, dragLock: Bool = false, tapToClick: Bool = true,
-                threeFingerSwipes: Bool = true) {
+                threeFingerSwipes: Bool = true, appExposeGesture: Bool = false) {
         self.keyRepeatDelay = keyRepeatDelay
         self.keyRepeatInterval = keyRepeatInterval
         self.naturalScrolling = naturalScrolling
@@ -39,11 +42,12 @@ public struct MacInputPreferences: Codable, Equatable, Sendable {
         self.dragLock = dragLock
         self.tapToClick = tapToClick
         self.threeFingerSwipes = threeFingerSwipes
+        self.appExposeGesture = appExposeGesture
     }
 
     private enum CodingKeys: String, CodingKey {
         case keyRepeatDelay, keyRepeatInterval, naturalScrolling, trackingIndex, fnKeysStandard
-        case doubleClickInterval, threeFingerDrag, dragLock, tapToClick, threeFingerSwipes
+        case doubleClickInterval, threeFingerDrag, dragLock, tapToClick, threeFingerSwipes, appExposeGesture
     }
 
     /// Absent keys keep their defaults, so either side may add settings later.
@@ -63,6 +67,7 @@ public struct MacInputPreferences: Codable, Equatable, Sendable {
         dragLock = try c.decodeIfPresent(Bool.self, forKey: .dragLock) ?? dragLock
         tapToClick = try c.decodeIfPresent(Bool.self, forKey: .tapToClick) ?? tapToClick
         threeFingerSwipes = try c.decodeIfPresent(Bool.self, forKey: .threeFingerSwipes) ?? threeFingerSwipes
+        appExposeGesture = try c.decodeIfPresent(Bool.self, forKey: .appExposeGesture) ?? appExposeGesture
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -81,6 +86,7 @@ public struct MacInputPreferences: Codable, Equatable, Sendable {
         try c.encode(dragLock, forKey: .dragLock)
         try c.encode(tapToClick, forKey: .tapToClick)
         try c.encode(threeFingerSwipes, forKey: .threeFingerSwipes)
+        try c.encode(appExposeGesture, forKey: .appExposeGesture)
     }
 
     /// The nearest settings that pass `validate()`. Use it on values read from the Mac's

@@ -2,33 +2,10 @@ import SwiftUI
 import IKeyCore
 
 /// Pairing on the left palm rest for unpaired, needsRepair and macTooOld: the only UI that appears by
-/// itself. The shell (`PadRootView`) decides when it shows and where it sits.
+/// itself. The shell (`PadRootView`) decides when it shows and where it sits. The problem it answers is
+/// `PadModel.pairingEpisode` (unpaired wording when there is none).
 struct PairingCard: View {
-    /// A needsRepair or macTooOld problem, kept by the shell through the automatic retries those
-    /// states make (`.connecting`/`.awaitingWelcome` every 10 s), so the card's wording stays put.
-    struct Episode: Equatable {
-        enum Kind: Equatable { case needsRepair, macTooOld }
-        var kind: Kind
-        /// `PadModel.status` when the problem was last seen (the card title and top-band hint).
-        var status: String
-
-        /// nil outside needsRepair and macTooOld.
-        init?(linkState: LinkState, status: String) {
-            switch linkState {
-            case .needsRepair: kind = .needsRepair
-            case .macTooOld: kind = .macTooOld
-            case .unpaired, .suspended, .backoff, .connecting, .awaitingWelcome, .connected, .replaced: return nil
-            }
-            self.status = status
-        }
-    }
-
     @ObservedObject var model: PadModel
-    /// The problem the card answers; nil derives it from the current link state (unpaired wording
-    /// outside needsRepair and macTooOld).
-    var episode: Episode? = nil
-    /// needsRepair only: hides the card while iKey keeps retrying the stored key. nil hides the button.
-    var onKeepWaiting: (() -> Void)? = nil
     /// Opens iKey settings; shown when the card covers the deck's own settings gesture (the
     /// two-finger hold on the left palm rest). nil hides the button.
     var onSettings: (() -> Void)? = nil
@@ -60,22 +37,26 @@ struct PairingCard: View {
                     .textFieldStyle(.roundedBorder)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                    // No password content type: the key stays device-only and must never be offered
-                    // to Passwords / iCloud Keychain AutoFill or saving (amendment A2).
+                    // No content type (never .password): the key stays device-only and must never be
+                    // offered to Passwords / iCloud Keychain AutoFill or saving (amendment A2).
                     .submitLabel(.go)
                     .onSubmit { if model.canConnect { model.connect() } }
                     .accessibilityHint("The 64-character key shown by iKey on your Mac.")
                 HStack(spacing: 12) {
+                    // An automatic retry in flight shows as "Connecting…" until a key is pasted, which
+                    // may pre-empt it (`PadModel.canConnect`).
+                    let busy = model.isConnecting && !model.canConnect
                     Button(action: model.connect) {
                         HStack(spacing: 8) {
-                            if model.isConnecting { ProgressView().controlSize(.small) }
-                            Text(model.isConnecting ? "Connecting…" : "Connect")
+                            if busy { ProgressView().controlSize(.small) }
+                            Text(busy ? "Connecting…" : "Connect")
                         }
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!model.canConnect)
-                    if problem?.kind == .needsRepair, let onKeepWaiting {
-                        Button("Keep waiting", action: onKeepWaiting)
+                    if problem?.kind == .needsRepair {
+                        // Reversible: the panel's pairing section can show the card again.
+                        Button("Keep waiting") { model.keepWaitingForRepair() }
                             .buttonStyle(.bordered)
                     }
                 }
@@ -125,9 +106,7 @@ struct PairingCard: View {
         }
     }
 
-    private var problem: Episode? {
-        episode ?? Episode(linkState: model.linkState, status: model.status)
-    }
+    private var problem: PairingEpisode? { model.pairingEpisode }
 
     private var title: String {
         problem?.status ?? "Pair with your Mac"

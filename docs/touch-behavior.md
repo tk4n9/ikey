@@ -266,14 +266,22 @@ With **Pause trackpad while typing** on:
 ## Opening the settings panel
 
 Hold **one fingertip still on the Touch ID key for 0.6 s** (moving at most
-4 mm). This works while connected, while disconnected and while input is paused.
-It is the only way in, because the deck has no gear button. A second touch on
-Touch ID cancels the hold. The alternative trigger, **two fingertips held for
-0.8 s on the left palm rest**, is chosen in the panel. Photo mode always uses
-it, because the photo has no Touch ID key.
+4 mm). This works while connected and while disconnected. It is the only way
+in, because the deck has no gear button. A second touch on Touch ID cancels the
+hold. The alternative trigger, **two fingertips held for 0.8 s on the left palm
+rest**, is chosen in the panel. Photo mode always uses it, because the photo
+has no Touch ID key. While the pairing card covers the left palm rest, the card
+has a settings button for that trigger.
 
 While the panel or Fit & Size is open, the deck sends nothing. Everything held
 is released once when it opens.
+
+**Pause input** in the panel's header keeps the connection but stops the deck
+after the panel closes, for example while you wipe the screen. Touching the
+deck does not resume it. The Touch ID ring shows paused, and a hint says how to
+resume: the settings gesture above (it then resumes instead of opening the
+panel), or **Resume input** in the panel. A relaunch or **Forget this Mac**
+also ends the pause.
 
 ## Known residuals (accepted, to tune on a device)
 

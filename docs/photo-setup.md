@@ -37,9 +37,10 @@ model number.
    first, then the trackpad. Use **Single key** for individual corrections.
    **Save** checks that the regions lie on the image and do not overlap. If a
    moved key overlaps its neighbour, shrink it first.
-5. Set **Deck** to **Photo** at the top of the Photo mode screen (importing does
-   not switch it). Close the panel. The outlines disappear, leaving the photo with light
-   pressed-key feedback.
+5. Check that **Deck**, at the top of the Photo mode screen, is set to
+   **Photo**. Importing a photo when none is stored switches it; replacing a
+   photo keeps your choice. Close the panel. The outlines disappear, leaving the
+   photo with light pressed-key feedback.
 
 The photo and the touch regions use the same aspect-fit rectangle, including any
 black bars, so alignment holds across screen sizes. If the photo's aspect ratio

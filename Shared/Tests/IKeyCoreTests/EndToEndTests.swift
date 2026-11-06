@@ -355,6 +355,36 @@ final class EndToEndTests: XCTestCase {
         ])
     }
 
+    // Regression: in 'system' Caps Lock mode a quick tap on the drawn Caps Lock (80-115 ms) turns
+    // the lock on, as on the MacBook, although the iPad sends the down 45 ms after the touch lands
+    // (key confirmation). A touch under 75 ms stays ignored; a longer hold turns it on 75 ms after
+    // the down reaches the Mac (0.13 s here), and each turns it on exactly once.
+    func testQuickCapsLockTapTurnsSystemCapsLockOn() {
+        for touch in [0.03, 0.06, 0.07, 0.08, 0.10, 0.115, 0.13, 0.2] {
+            var s = Script()
+            s.hold(id: 1, key(57), from: 0.01, until: 0.01 + touch)
+            let trace = run(s)
+            let on = touch >= 0.075
+            XCTAssertEqual(trace.input, on ? [.setCapsLock(true)] : [], "touch \(touch)")
+            if on { assertTimes(trace.times(of: [0]), [min(0.01 + touch, 0.13)]) }
+            XCTAssertEqual(trace.sent, [.key(code: 57, down: true), .key(code: 57, down: false)], "touch \(touch)")
+        }
+    }
+
+    // Regression: with the remap but Caps Lock in 'system' mode (switching off, or not read yet),
+    // a tap on the drawn left Command (tap-only: its down and up leave together at the lift) turns
+    // Caps Lock on and the next tap turns it off, like the remapped key's ordinary tap.
+    func testRemappedLeftCommandTapTogglesSystemCapsLock() {
+        var s = Script()
+        s.hold(id: 1, key(55), from: 0, until: 0.12)
+        s.hold(id: 2, key(55), from: 1.0, until: 1.1)
+        var settings = userInjector
+        settings.capsMode = .system
+        let trace = run(s, typing: userTyping, settings: settings)
+        XCTAssertEqual(trace.input, [.setCapsLock(true), .setCapsLock(false)])
+        assertTimes(trace.times(of: [0, 1]), [0.12, 1.1])
+    }
+
     /// The iPad's typing settings as the Mac's remap reaches it: the Mac announces its tap-only
     /// codes in MacState.tapOnly (as ReceiverModel does), the frame crosses the wire split in two,
     /// and the iPad adds the decoded codes to its tap-only set (as PadModel.effectiveTyping does).

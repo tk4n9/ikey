@@ -254,6 +254,11 @@ private struct SettingsSection: View {
             Text("Emoji & Symbols").tag(Optional<FnTapAction>.some(.emojiAndSymbols))
             Text("Do nothing").tag(Optional<FnTapAction>.some(FnTapAction.none))
         }
+        if receiver.inputSourceShortcutNeeded {
+            Text("Korean, Chinese or Japanese input may not switch in the app you type in. Turn on System Settings › Keyboard › Keyboard Shortcuts › Input Sources › \u{201C}Select the previous input source\u{201D}.")
+                .font(.caption).foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private var capsEffect: String {

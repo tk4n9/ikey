@@ -88,20 +88,20 @@ the deck sends a lone fn only when it was tapped within 0.30 s (see
 [modifiers are lazy](touch-behavior.md#modifiers-are-lazy)). A tap performs the
 Globe action:
 
-- **Change Input Source**: switches to the previously used input source, as a
+- **Change input source**: switches to the previously used input source, as a
   real Globe tap does. The Mac selects the source directly (`TISSelectInputSource`).
   Only when that fails does it post the "Select the previous input source"
   shortcut (symbolic hot key 60), lifting any held modifiers around it.
 - **Emoji & Symbols**: ⌃⌘Space.
 - **Do nothing**.
 
-The Mac menu's **Globe key** setting chooses one:
+The **Globe key** setting (under **Settings** in the Mac menu) chooses one:
 
 - **Automatic** (default): follows the Mac's own **Press 🌐 key to** setting.
-  If that is unset, it uses Change Input Source when more than one input source
+  If that is unset, it uses Change input source when more than one input source
   is enabled, and Do nothing otherwise. Dictation cannot be posted, so a Mac set
   to Dictation gets Do nothing.
-- **Change Input Source**, **Emoji & Symbols** or **Do nothing**.
+- **Change input source**, **Emoji & Symbols** or **Do nothing**.
 
 Held fn still works as a modifier: for fn + arrows, fn + F-keys and fn-click.
 

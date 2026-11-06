@@ -41,7 +41,7 @@ struct MacReadings: Equatable {
 enum MacPreferencesReader {
     static func read() -> MacReadings {
         // Other processes write these domains; pick up their latest values.
-        for domain in [trackpadDomain, hotKeysDomain, toolboxDomain] { CFPreferencesAppSynchronize(domain as CFString) }
+        for domain in [trackpadDomain, hotKeysDomain, toolboxDomain, dockDomain] { CFPreferencesAppSynchronize(domain as CFString) }
         let display = builtInDisplay()
         return MacReadings(
             prefs: readPreferences(),
@@ -60,6 +60,7 @@ enum MacPreferencesReader {
     private static let trackpadDomain = "com.apple.AppleMultitouchTrackpad"
     private static let hotKeysDomain = "com.apple.symbolichotkeys"
     private static let toolboxDomain = "com.apple.HIToolbox"
+    private static let dockDomain = "com.apple.dock"
 
     // MARK: Preferences
 
@@ -80,18 +81,60 @@ enum MacPreferencesReader {
         // Low confidence: these keys hold the built-in trackpad's settings on current macOS.
         // Absent keys keep MacInputPreferences' defaults, except Clicking: macOS ships with Tap
         // to click off, while the wire default is on.
-        func trackpadFlag(_ key: String) -> Bool? {
-            let value = appValue(key, domain: trackpadDomain)
-            if let number = value as? Int { return number != 0 }
-            if let text = value as? String { return (text as NSString).boolValue }
+        func intValue(_ key: String, domain: String) -> Int? {
+            let value = appValue(key, domain: domain)
+            if let number = value as? Int { return number }
+            if let text = value as? String {
+                return Int(text.trimmingCharacters(in: .whitespaces)) ?? ((text as NSString).boolValue ? 1 : 0)
+            }
             return nil
         }
+        func trackpadInt(_ key: String) -> Int? { intValue(key, domain: trackpadDomain) }
+        func trackpadFlag(_ key: String) -> Bool? { trackpadInt(key).map { $0 != 0 } }
         if let value = trackpadFlag("TrackpadThreeFingerDrag") { prefs.threeFingerDrag = value }
         if let value = trackpadFlag("DragLock") { prefs.dragLock = value }
         prefs.tapToClick = trackpadFlag("Clicking") ?? false
-        if let value = trackpadFlag("TrackpadThreeFingerHorizSwipeGesture") { prefs.threeFingerSwipes = value }
+        // The swipe keys of the finger count iKey swipes with (four while three-finger drag is
+        // on, as InjectorCore and TrackpadRecognizer use; System Settings moves the swipes there).
+        let fingers = prefs.threeFingerDrag ? "Four" : "Three"
+        let vertical = trackpadInt("Trackpad\(fingers)FingerVertSwipeGesture")
+        if let value = swipeGesturesEnabled(horizontal: trackpadInt("Trackpad\(fingers)FingerHorizSwipeGesture"),
+                                            vertical: vertical) {
+            prefs.threeFingerSwipes = value
+        }
+        prefs.appExposeGesture = appExposeGestureEnabled(
+            dockFlag: intValue("showAppExposeGestureEnabled", domain: dockDomain).map { $0 != 0 },
+            vertical: vertical)
         // `defaults write` can store values System Settings never offers; the wire rejects them.
         return prefs.clamped()
+    }
+
+    /// `threeFingerSwipes` is iKey's single switch for the Mac's swipes at iKey's swipe finger
+    /// count: left/right Spaces (^←/^→), up Mission Control, down App Exposé (only while
+    /// `appExposeGesture` is on too; see appExposeGestureEnabled). The Mac stores
+    /// them per axis and finger count: Trackpad{Three,Four}FingerHorizSwipeGesture is 0 off,
+    /// 1 'swipe between pages' (three fingers only) or 2 'swipe between full-screen
+    /// applications'; Trackpad{Three,Four}FingerVertSwipeGesture is 0 off or 2 Mission Control /
+    /// App Exposé. Only 2 means Spaces: a value of 1 must not make a page swipe switch Spaces.
+    /// The horizontal key decides (a mistaken Spaces switch is worse than a missing Mission
+    /// Control swipe); the vertical key only when the horizontal one is absent. nil (both
+    /// absent) keeps the default. iKey cannot express 'pages' or a per-axis split (open item).
+    static func swipeGesturesEnabled(horizontal: Int?, vertical: Int?) -> Bool? {
+        if let horizontal { return horizontal == 2 }
+        if let vertical { return vertical == 2 }
+        return nil
+    }
+
+    /// System Settings > Trackpad > More Gestures > App Exposé. The Mac stores the switch as
+    /// com.apple.dock showAppExposeGestureEnabled (absent on a new Mac, where it is off) and
+    /// puts the gesture on Mission Control's finger count: choosing three or four fingers sets
+    /// that count's Trackpad{Three,Four}FingerVertSwipeGesture to 2. So a vertical key of 0 at
+    /// iKey's swipe finger count means a swipe down there does nothing on the Mac (App Exposé
+    /// sits on the other count, or vertical swipes are off). An absent vertical key leaves the
+    /// dock switch alone. `threeFingerSwipes` still gates every swipe on the iPad side.
+    static func appExposeGestureEnabled(dockFlag: Bool?, vertical: Int?) -> Bool {
+        guard dockFlag == true else { return false }
+        return vertical.map { $0 == 2 } ?? true
     }
 
     private static func appValue(_ key: String, domain: String) -> Any? {

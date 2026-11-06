@@ -235,9 +235,9 @@ final class InjectorCoreTests: XCTestCase {
 
     func testCapsSystemSetEvent() {
         var core = InjectorCore()
-        // A 40 ms tap does nothing.
+        // A 25 ms sender gap (a 70 ms touch: the iPad sends the down 45 ms after landing) does nothing.
         XCTAssertEqual(key(&core, 57, true, at: 0), [])
-        XCTAssertEqual(key(&core, 57, false, at: 0.04), [])
+        XCTAssertEqual(key(&core, 57, false, at: 0.025), [])
         // Held past 75 ms: the deadline turns Caps Lock on.
         _ = key(&core, 57, true, at: 1)
         XCTAssertEqual(core.nextDeadline ?? -1, 1.075, accuracy: 1e-9)
@@ -250,6 +250,60 @@ final class InjectorCoreTests: XCTestCase {
         // Mouse and key events carry the lock flag.
         XCTAssertEqual(key(&core, 0, true, at: 2.1, env: on),
                        [.key(code: 0, down: true, flags: [.nonCoalesced, .alphaShift], autorepeat: false)])
+    }
+
+    /// Regression: the iPad sends Caps Lock's down after its 45 ms key confirmation, so the sender
+    /// gap is the touch minus 45 ms. A quick 80-115 ms tap, which turns the hardware key's lock on,
+    /// must turn it on here too; a tap under 75 ms (sender gap under 30 ms) stays ignored.
+    func testCapsSystemQuickTapCountsFromTouchDown() {
+        let cases: [(touch: TimeInterval, expected: [SynthEvent])] = [
+            (0.03, []), (0.07, []), (0.08, [.setCapsLock(true)]), (0.10, [.setCapsLock(true)]),
+            (0.115, [.setCapsLock(true)]),
+        ]
+        for (touch, expected) in cases {
+            var core = InjectorCore()
+            let downAt = min(0.045, touch)  // lifted before confirmation: down and up go together
+            XCTAssertEqual(key(&core, 57, true, at: downAt), [], "touch \(touch)")
+            XCTAssertEqual(key(&core, 57, false, at: touch), expected, "touch \(touch)")
+            XCTAssertEqual(core.tick(at: 5, env: env), [], "touch \(touch)")
+        }
+        // An iPad without the confirmation delay (palm protection off) measures the whole touch.
+        var direct = InjectorCore(settings: settings { $0.padKeyConfirmationDelay = 0 })
+        _ = key(&direct, 57, true, at: 0)
+        XCTAssertEqual(key(&direct, 57, false, at: 0.05), [])
+        _ = key(&direct, 57, true, at: 1)
+        XCTAssertEqual(key(&direct, 57, false, at: 1.08), [.setCapsLock(true)])
+        // The switch-mode hold counts from the touch too: a 470 ms touch is a tap, a 520 ms one a hold.
+        var sw = InjectorCore(settings: settings { $0.capsMode = .switchesInputSource })
+        _ = key(&sw, 57, true, at: 0.045)
+        XCTAssertEqual(key(&sw, 57, false, at: 0.47), [ctrlSpaceSwitch])
+        _ = key(&sw, 57, true, at: 1.045)
+        XCTAssertEqual(key(&sw, 57, false, at: 1.52), [.setCapsLock(true)])
+    }
+
+    /// Regression: a deck modifier remapped to Caps Lock (left Command, 55 → 57) sends a lone tap's
+    /// down and up together at its lift, so in 'system' mode the tap turns the lock on (and the
+    /// next tap off), like the remapped hardware key's ordinary tap. In 'switches input source'
+    /// mode the same tap still switches; the physical Caps Lock's same-instant tap stays ignored.
+    func testRemappedModifierTapTogglesSystemCapsLock() {
+        var core = InjectorCore(settings: settings { $0.keyRemap = [55: 57] })
+        XCTAssertEqual(key(&core, 55, true, at: 0.12), [])
+        XCTAssertEqual(key(&core, 55, false, at: 0.12), [.setCapsLock(true)])
+        var on = env
+        on.capsLockOn = true
+        XCTAssertEqual(key(&core, 55, true, at: 1.1, env: on), [.setCapsLock(false)])
+        XCTAssertEqual(key(&core, 55, false, at: 1.1, env: on), [])
+        // A chorded (timed) press is still judged by its duration.
+        XCTAssertEqual(key(&core, 55, true, at: 2), [])
+        XCTAssertEqual(key(&core, 55, false, at: 2.01), [])
+
+        var unmapped = InjectorCore()
+        XCTAssertEqual(key(&unmapped, 57, true, at: 0.03), [])
+        XCTAssertEqual(key(&unmapped, 57, false, at: 0.03), [])
+
+        var switching = InjectorCore(settings: userRemap)
+        XCTAssertEqual(key(&switching, 55, true, at: 0.12), [])
+        XCTAssertEqual(key(&switching, 55, false, at: 0.12), [ctrlSpaceSwitch])
     }
 
     /// The input-source switch, with the Mac's ^Space shortcut as the poster's fallback.
@@ -648,6 +702,30 @@ final class InjectorCoreTests: XCTestCase {
                               .key(code: 124, down: false, flags: heldFlags, autorepeat: false)])
     }
 
+    /// Regression: the swipe down is App Exposé only when the Mac's App Exposé gesture is on (off
+    /// on a new Mac); the left/right swipe preference does not turn it on. Closing Mission Control
+    /// with a swipe down works either way.
+    func testSwipeDownAppExposeFollowsItsOwnPreference() {
+        let down = WireGesture(kind: .swipe, fingers: 3, direction: "down")
+        let keyFlags = ModifierFlags(rawValue: 0xA40000 | 0x1 | 0x100)
+        let appExpose = chord(125, modifier: 59, modFlags: [.control, .leftControl], keyFlags: keyFlags)
+        var core = InjectorCore()
+        XCTAssertFalse(InjectorSettings().prefs.appExposeGesture)
+        XCTAssertTrue(InjectorSettings().prefs.threeFingerSwipes)
+        XCTAssertEqual(send(&core, .gesture(down), at: 0), [])
+        // Mission Control opened by a swipe up still closes with a swipe down.
+        _ = send(&core, .gesture(WireGesture(kind: .swipe, fingers: 3, direction: "up")), at: 1)
+        XCTAssertEqual(quiet(send(&core, .gesture(down), at: 2)),
+                       chord(126, modifier: 59, modFlags: [.control, .leftControl], keyFlags: keyFlags))
+
+        core.update(settings: settings { $0.prefs.appExposeGesture = true })
+        XCTAssertEqual(quiet(send(&core, .gesture(down), at: 3)), appExpose)
+        var initial = InjectorCore(settings: settings { $0.prefs.appExposeGesture = true })
+        XCTAssertEqual(quiet(send(&initial, .gesture(down), at: 0)), appExpose)
+        core.update(settings: settings { $0.prefs.appExposeGesture = false })
+        XCTAssertEqual(send(&core, .gesture(down), at: 4), [])
+    }
+
     func testThreeFingerTapLooksUp() {
         var core = InjectorCore()
         let events = quiet(send(&core, .gesture(WireGesture(kind: .tap, fingers: 3)), at: 0))
@@ -833,5 +911,176 @@ final class InjectorCoreTests: XCTestCase {
         var reference = ScrollSynthesizer(curves: steep)
         let expected = reference.input(.began, dxMM: 0, dyMM: 2, dt: 1.0 / 120, speed: 100, releaseVX: nil, releaseVY: nil, at: 1)
         XCTAssertEqual(next, expected)
+    }
+
+    // MARK: - Final review regressions
+
+    private var missionControlToggle: [SynthEvent] {
+        chord(126, modifier: 59, modFlags: [.control, .leftControl],
+              keyFlags: ModifierFlags(rawValue: 0xA40000 | 0x1 | 0x100))
+    }
+
+    private func swipe(_ direction: String, fingers: Int = 3) -> PadInput {
+        .gesture(WireGesture(kind: .swipe, fingers: fingers, direction: direction))
+    }
+
+    /// Regression: moving the pointer (or scrolling) over Mission Control's windows cannot close it,
+    /// so the swipe down afterwards closes it and a second swipe up keeps it open, as on a MacBook.
+    /// Clicks and key presses may close it and still end the 'open' window; a key's up does not.
+    func testPointerMotionKeepsMissionControlOpen() {
+        let motion = PadInput.motion(PointerMotion(dx: 3, dy: 0, dt: 0.01, speed: 300))
+        var core = InjectorCore()
+        XCTAssertEqual(quiet(send(&core, swipe("up"), at: 1)), missionControlToggle)
+        XCTAssertEqual(moves(send(&core, motion, at: 2)).count, 1)
+        _ = send(&core, scrollInput(.began, dy: 2), at: 2.1)
+        _ = send(&core, scrollInput(.ended), at: 2.2)
+        XCTAssertEqual(quiet(send(&core, swipe("down"), at: 3)), missionControlToggle)
+
+        var again = InjectorCore()
+        _ = send(&again, swipe("up"), at: 1)
+        _ = send(&again, motion, at: 2)
+        XCTAssertEqual(quiet(send(&again, swipe("up"), at: 3)), [])
+        // A click may have closed it: the next swipe up opens it again.
+        _ = send(&again, .button(button: .left, down: true, clickState: 1), at: 4)
+        _ = send(&again, .button(button: .left, down: false, clickState: 1), at: 4.1)
+        XCTAssertEqual(quiet(send(&again, swipe("up"), at: 5)), missionControlToggle)
+        // So may a key press (Escape): the next swipe down is App Exposé, off by default.
+        _ = key(&again, 53, true, at: 6)
+        _ = key(&again, 53, false, at: 6.05)
+        XCTAssertEqual(send(&again, swipe("down"), at: 7), [])
+
+        // A key that was already down before the swipe and lifts during Mission Control changes nothing.
+        var held = InjectorCore()
+        _ = key(&held, 0, true, at: 0.5)
+        _ = send(&held, swipe("up"), at: 1)
+        _ = key(&held, 0, false, at: 1.5)
+        XCTAssertEqual(quiet(send(&held, swipe("down"), at: 2)), missionControlToggle)
+    }
+
+    /// Regression: switching Spaces inside Mission Control keeps it open on the Mac side too.
+    func testSpaceSwipeInsideMissionControlKeepsItOpen() {
+        var core = InjectorCore()
+        _ = send(&core, swipe("up"), at: 1)
+        XCTAssertEqual(quiet(send(&core, swipe("left"), at: 2)).count, 4)
+        XCTAssertEqual(quiet(send(&core, swipe("down"), at: 3)), missionControlToggle)
+    }
+
+    /// Regression: Mission Control opened with the Mission Control key (F3) is tracked like one
+    /// opened by a swipe up; pressed while open, the key closes it. With Command held the key does
+    /// something else (Show Desktop) and counts as an ordinary key press.
+    func testMissionControlKeyCountsForSwipes() {
+        func pressF3(_ core: inout InjectorCore, at t: TimeInterval) -> [SynthEvent] {
+            let down = key(&core, 99, true, at: t)
+            return down + key(&core, 99, false, at: t + 0.1)
+        }
+        var core = InjectorCore()
+        let f3 = pressF3(&core, at: 1)
+        XCTAssertTrue(f3.contains { event in
+            if case .key(code: 160, down: true, flags: _, autorepeat: false) = event { return true }
+            return false
+        }, "\(f3)")
+        XCTAssertEqual(quiet(send(&core, swipe("down"), at: 2)), missionControlToggle)
+
+        var keep = InjectorCore()
+        _ = pressF3(&keep, at: 1)
+        XCTAssertEqual(quiet(send(&keep, swipe("up"), at: 2)), [])
+        XCTAssertEqual(quiet(send(&keep, swipe("down"), at: 3)), missionControlToggle)
+
+        var closedByKey = InjectorCore()
+        _ = send(&closedByKey, swipe("up"), at: 1)
+        _ = pressF3(&closedByKey, at: 2)
+        XCTAssertEqual(send(&closedByKey, swipe("down"), at: 3), [])
+        XCTAssertEqual(quiet(send(&closedByKey, swipe("up"), at: 4)), missionControlToggle)
+
+        var command = InjectorCore()
+        _ = send(&command, swipe("up"), at: 1)
+        _ = key(&command, 55, true, at: 2)
+        _ = pressF3(&command, at: 2.1)
+        _ = key(&command, 55, false, at: 2.3)
+        XCTAssertEqual(quiet(send(&command, swipe("up"), at: 3)), missionControlToggle)
+    }
+
+    /// Regression: an iPad set to three-finger drag on its own swipes with four fingers; a Mac
+    /// without three-finger drag (three-finger swipes) still acts on them. A Mac with three-finger
+    /// drag still ignores three-finger swipes (three fingers drag there).
+    func testSwipeWithMoreFingersThanTheMacsCountWorks() {
+        var core = InjectorCore()
+        XCTAssertEqual(quiet(send(&core, swipe("left", fingers: 4), at: 0)).count, 4)
+        XCTAssertEqual(quiet(send(&core, swipe("up", fingers: 4), at: 1)), missionControlToggle)
+        XCTAssertEqual(quiet(send(&core, swipe("down", fingers: 4), at: 2)), missionControlToggle)
+        var drag = InjectorCore(settings: settings { $0.prefs.threeFingerDrag = true })
+        XCTAssertEqual(send(&drag, swipe("left", fingers: 3), at: 0), [])
+        XCTAssertEqual(quiet(send(&drag, swipe("left", fingers: 5), at: 1)).count, 4)
+    }
+
+    /// Regression: the Mac's trackpad scrolling speed (its scroll acceleration index) shapes iKey's
+    /// scroll acceleration; nil or an invalid index uses the default, and a change waits for idle.
+    func testScrollFollowsMacScrollIndex() {
+        func reference(index: Double?, at t: TimeInterval) -> [ScrollFrame] {
+            var synth = index.map { ScrollSynthesizer(scrollIndex: $0) } ?? ScrollSynthesizer()
+            return synth.input(.began, dxMM: 0, dyMM: 6, dt: 1.0 / 120, speed: 100, releaseVX: nil, releaseVY: nil, at: t)
+        }
+        XCTAssertEqual(ScrollSynthesizer.defaultScrollIndex, 0.6875)
+        XCTAssertNotEqual(reference(index: 2.0, at: 0), reference(index: nil, at: 0))
+        var fast = InjectorCore(settings: settings { $0.scrollIndexOverride = 2.0 })
+        XCTAssertEqual(frames(send(&fast, scrollInput(.began, dy: 6), at: 0)), reference(index: 2.0, at: 0))
+        for bad in [Double.nan, -1, 3.5, .infinity] {
+            var core = InjectorCore(settings: settings { $0.scrollIndexOverride = bad })
+            XCTAssertEqual(frames(send(&core, scrollInput(.began, dy: 6), at: 0)), reference(index: nil, at: 0), "\(bad)")
+        }
+
+        var live = InjectorCore()
+        XCTAssertEqual(frames(send(&live, scrollInput(.began, dy: 6), at: 0)), reference(index: nil, at: 0))
+        live.update(settings: settings { $0.scrollIndexOverride = 2.0 })
+        var open = ScrollSynthesizer()
+        _ = open.input(.began, dxMM: 0, dyMM: 6, dt: 1.0 / 120, speed: 100, releaseVX: nil, releaseVY: nil, at: 0)
+        let during = open.input(.changed, dxMM: 0, dyMM: 6, dt: 1.0 / 120, speed: 100, releaseVX: nil, releaseVY: nil,
+                                at: 0.01)
+        XCTAssertEqual(frames(send(&live, scrollInput(.changed, dy: 6), at: 0.01)), during)
+        XCTAssertEqual(frames(send(&live, scrollInput(.ended), at: 0.02)).map(\.phase), [4])
+        XCTAssertEqual(frames(send(&live, scrollInput(.began, dy: 6), at: 1)), reference(index: 2.0, at: 1))
+    }
+
+    /// Regression: the iPad states its key confirmation delay in its heartbeats; with palm protection
+    /// off (0) the Mac stops adding a phantom 45 ms to Caps Lock holds. A 35 ms graze then leaves the
+    /// lock off, and a 470 ms touch in 'switches input source' mode stays a tap.
+    func testHeartbeatKeyConfirmDelayTimesCapsLock() {
+        func beat(_ core: inout InjectorCore, _ delay: Double?, at t: TimeInterval) {
+            _ = core.handle(.heartbeat(Heartbeat(seq: 1, held: [], buttons: [], active: false, keyConfirmDelay: delay),
+                                       t: Int64((t * 1e6).rounded())), at: t, env: env)
+        }
+        // No heartbeat value yet: the settings' 45 ms is added back.
+        var core = InjectorCore()
+        _ = key(&core, 57, true, at: 0)
+        XCTAssertEqual(key(&core, 57, false, at: 0.035), [.setCapsLock(true)])
+
+        var off = InjectorCore()
+        beat(&off, 0, at: 0.5)
+        _ = key(&off, 57, true, at: 1)
+        XCTAssertEqual(key(&off, 57, false, at: 1.035), [])
+        XCTAssertEqual(off.tick(at: 1.5, env: env), [])
+        _ = key(&off, 57, true, at: 2)
+        XCTAssertEqual(key(&off, 57, false, at: 2.08), [.setCapsLock(true)])
+        // A heartbeat without the field (older iPad) and a settings update keep the stated value.
+        beat(&off, nil, at: 3)
+        off.update(settings: settings { $0.prefs.naturalScrolling = false })
+        var on = env
+        on.capsLockOn = true
+        XCTAssertEqual(key(&off, 57, true, at: 4, env: on), [.setCapsLock(false)])
+        _ = key(&off, 57, false, at: 4.1, env: on)
+        _ = key(&off, 57, true, at: 5)
+        XCTAssertEqual(key(&off, 57, false, at: 5.035), [])
+        // Palm protection back on: 45 ms again.
+        beat(&off, 0.045, at: 6)
+        _ = key(&off, 57, true, at: 7)
+        XCTAssertEqual(key(&off, 57, false, at: 7.035), [.setCapsLock(true)])
+
+        var switching = InjectorCore(settings: settings { $0.capsMode = .switchesInputSource })
+        _ = key(&switching, 57, true, at: 1)
+        XCTAssertEqual(key(&switching, 57, false, at: 1.47), [.setCapsLock(true)])
+        var direct = InjectorCore(settings: settings { $0.capsMode = .switchesInputSource })
+        beat(&direct, 0, at: 0.5)
+        _ = key(&direct, 57, true, at: 1)
+        XCTAssertEqual(key(&direct, 57, false, at: 1.47), [ctrlSpaceSwitch])
     }
 }

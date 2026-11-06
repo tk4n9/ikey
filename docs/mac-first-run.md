@@ -105,7 +105,7 @@ fails, stop and capture the first error instead of continuing.
 15. **Run iKeyPad.** Choose scheme `iKeyPad`, your iPad, and press ⌘R. Allow
     Local Network access when asked. Keep the iPad in landscape.
 
-16. **Pair once.** On the Mac choose **Copy** under Pairing; Universal Clipboard
+16. **Pair once.** On the Mac choose **Copy Pairing Key** under Pairing; Universal Clipboard
     carries the key over. On the iPad, the pairing card on the left palm rest
     lists nearby Macs. Pick yours, paste the 64-character key and tap
     **Connect**. Without Universal Clipboard, choose **Show** on the Mac and type
@@ -157,14 +157,14 @@ awake while you type only on the iPad.
 ## Caps Lock and input sources
 
 A real MacBook applies Caps Lock behaviour in its keyboard driver, which posted
-events bypass. iKey therefore implements it on the Mac. The menu's **Caps Lock**
-setting:
+events bypass. iKey therefore implements it on the Mac. The **Caps Lock** setting is under
+**Settings** in the menu, with an **In effect** line below it:
 
 | Choice | Behaviour |
 |---|---|
 | **Automatic** (default) | **Switches input source** when the Mac's "Use the Caps Lock key to switch to and from ABC" is on and more than one input source is enabled; otherwise **Turns caps lock on**. |
-| **Turns caps lock on** | The real system lock. A press shorter than 75 ms is ignored, like the hardware key. Each change is read back. If the Mac refuses it, iKey falls back to Virtual and the menu says so. |
-| **Switches input source** | A tap shorter than 0.5 s switches to the previous input source (`TISSelectInputSource`; the "Select the previous input source" shortcut only if that fails). A hold of 0.5 s or longer toggles Caps Lock. If the Mac refuses the Caps Lock change, only the hold is lost: the menu says "Long-press Caps Lock toggle unavailable; input switching still works". |
+| **Turns caps lock on** | The real system lock. A press shorter than 75 ms is ignored, like the hardware key. Each change is read back. If the Mac refuses it, iKey falls back to Virtual and the In effect line reads "virtual (permission needed)". |
+| **Switches input source** | A tap shorter than 0.5 s switches to the previous input source (`TISSelectInputSource`; the "Select the previous input source" shortcut only if that fails). A hold of 0.5 s or longer toggles Caps Lock. If the Mac refuses a Caps Lock change, the mode is kept and only the hold is lost: the menu says "Long-press Caps Lock toggle unavailable; input switching still works" until a later change succeeds or you change the setting. |
 | **Virtual** | An iKey-only lock carried in the event flags; the system indicator does not change. |
 
 The iPad's Caps Lock LED follows the Mac's state within about 0.1 s (Virtual
@@ -216,12 +216,19 @@ because those are the keys under your fingers.
 
 The menu's **Key remapping** section shows:
 
-- the detected layers, and the effective mapping in words (for example
-  "Left ⌘ → Caps Lock, Caps Lock → Esc — from Karabiner");
-- **Apply my Mac's key remapping** (on by default). Off posts every key as
-  drawn;
-- a small editor for extra manual pairs;
-- **Left ⌘ acts as Caps Lock / input switch (tap only)** when that applies.
+- **Apply my Mac's key remapping** (on by default). Off sends every key as
+  printed on the iPad.
+- **Detected:** where the remap came from (for example "From
+  Karabiner-Elements") and one line per pair, such as "Left ⌘ → Caps Lock" and
+  "Caps Lock → Esc". Until the first read it says "Read while iKey is on" (the
+  receiver is not listening) or "Reading this Mac's key remapping…".
+- **In effect:** the pairs actually applied, plus a tap-only line such as
+  "Left ⌘ acts as Caps Lock / input switch (tap only)". The "/ input switch"
+  part appears when the Caps Lock mode in effect is Switches input source.
+- **Extra pairs:** pick a key, a target (any editable key or **No Action**)
+  and **Add**; **Remove** deletes a pair. Extra pairs override detected ones and
+  apply only while remapping is on. A key mapped to itself cancels a detected
+  remap.
 
 **Tap-only keys.** When a modifier is remapped to something that is not a
 modifier, the Mac tells the iPad, and the deck types that key **only as a tap**.
@@ -230,7 +237,9 @@ keys) it never presses when rested on. A tap of the user's left ⌘ switches inp
 source as on the real MacBook. Holding it does nothing, so the macOS long-press
 Caps Lock toggle is not available from that key. With resting fingers Off, the
 key goes down after 45 ms and stays down while held, like a real Caps Lock key,
-so a long hold can toggle Caps Lock. See
+so a long hold can toggle Caps Lock. The Mac sends the tap-only list after its
+first remap read, within about 2 s of the receiver starting to listen. Until
+then the iPad uses the list it saved for that Mac. See
 [touch behavior](touch-behavior.md#tap-only-keys).
 
 ## Optional: Deck check and Input Monitoring
@@ -250,10 +259,14 @@ need this.
 ## Troubleshooting
 
 - **The iPad says "Update iKey on your Mac".** The Mac runs an older iKey (protocol
-  v1). Build and run the current iKeyMac.
+  v1). Build and run the current iKeyMac. To use another Mac instead, paste its
+  key in the pairing card or the panel's **Pair with another Mac** section.
 - **"Can't reach <Mac> — the pairing key may have changed".** The Mac's key was
   replaced, or it is a different Mac. Copy the key again and paste it in the
-  pairing card. The old pairing is kept until the new one works.
+  pairing card. The old pairing is kept until the new one works. If you tapped
+  **Keep waiting**, the card is hidden while iKey keeps retrying; open the
+  settings panel and use its **Pair again** section, which can show the card
+  again or take the key directly.
 - **No Mac in the pairing card.** Keep both devices on the same Wi-Fi, check
   Local Network access on both, and make sure the Mac menu says Ready.
 - **Prompts after every rebuild.** Signing is ad hoc; set up `Config/Local.xcconfig`

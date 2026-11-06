@@ -130,13 +130,20 @@ public struct DeckInputEngine {
         }
         palmRestMaxX = deck.trackpad.minX
         keyFieldBottom = deck.keys.map(\.rect.maxY).max() ?? deck.trackpad.minY
-        pipeline = KeyCommitPipeline(settings: typing, confirmationDelay: protection.enabled ? Self.keyConfirmDelay : 0)
+        pipeline = KeyCommitPipeline(settings: typing, confirmationDelay: Self.keyConfirmationDelay(for: protection))
         recognizer = TrackpadRecognizer(geometry: geometry, settings: trackpad, protectionScale: protectionScale)
         let holdTravel = Self.holdTravelMM / mmPerPoint
         switch panelTrigger {
         case .touchIDHold: hold = HoldDetector(holdTime: 0.6, maxTravelPt: holdTravel, fingers: 1)
         case .palmRestTwoFingerHold: hold = HoldDetector(holdTime: 0.8, maxTravelPt: holdTravel, fingers: 2)
         }
+    }
+
+    /// How long after a key contact lands the engine posts a confirmed key's down: 45 ms with palm
+    /// protection on, 0 with it off. The iPad sends it in every heartbeat (`Heartbeat.keyConfirmDelay`)
+    /// so the Mac can time Caps Lock holds from the touch.
+    public static func keyConfirmationDelay(for protection: TouchProtectionSettings) -> TimeInterval {
+        protection.enabled ? keyConfirmDelay : 0
     }
 
     // MARK: - Touches

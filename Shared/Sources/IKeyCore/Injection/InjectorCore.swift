@@ -40,6 +40,11 @@ public struct InjectorSettings: Equatable, Sendable {
     public var scrollCurves: [HIDAccelCurve]? = nil
     /// Live tracking index; nil uses `prefs.trackingIndex`.
     public var trackingIndexOverride: Double? = nil
+    /// The trackpad's scrolling speed as its live scroll acceleration index (IOHID
+    /// HIDTrackpadScrollAcceleration, set by Accessibility > Pointer Control > Trackpad Options >
+    /// Scrolling speed); nil or invalid uses `ScrollSynthesizer.defaultScrollIndex`. Posted scroll
+    /// events bypass the Mac's own scroll acceleration, so iKey applies it at this index.
+    public var scrollIndexOverride: Double? = nil
     public var gainScale: Double = 1
     public var speedAxisScale: Double = 1
     public var scrollBasePtPerMM: Double = 5.0
@@ -50,6 +55,12 @@ public struct InjectorSettings: Equatable, Sendable {
     /// The Mac's own key remapping (hidutil, Modifier Keys, Karabiner), Mac virtual key code
     /// to key code. Posted events bypass it, so it is applied to every incoming key first.
     public var keyRemap: [UInt16: UInt16] = [:]
+    /// How long after a key contact lands the iPad posts its down: DeckInputEngine's key
+    /// confirmation delay with palm protection on (the default). Caps Lock holds judged by sender
+    /// times add it back, so a quick tap that the hardware key would take turns Caps Lock on.
+    /// 0 when the iPad confirms keys at once (palm protection off). Used until the iPad states
+    /// its own value in a heartbeat (`Heartbeat.keyConfirmDelay`), which then wins.
+    public var padKeyConfirmationDelay: Double = 0.045
 
     public init() {}
 }
@@ -61,6 +72,8 @@ public struct InjectorCore: Sendable {
     private static let userActivityInterval = 1.0
     /// Symbolic hot key id of 'Select the previous input source'.
     private static let previousInputSourceHotKey = 60
+    /// The Mission Control key's code (kVK 160, what the F3 key posts by default; it toggles).
+    private static let missionControlKeyCode: UInt16 = 160
 
     /// Chord modifiers in posting order: mask bit, the left-side key that posts it, its flags.
     private static let chordModifiers: [(mask: ModifierFlags, code: UInt16, flags: ModifierFlags)] = [
@@ -77,7 +90,8 @@ public struct InjectorCore: Sendable {
     private var cursor = VirtualCursor()
     private var scroll: ScrollSynthesizer
     private var scrollCurvesInUse: [HIDAccelCurve]
-    /// New scroll curves wait until no scroll or momentum is in flight.
+    private var scrollIndexInUse: Double
+    /// New scroll curves or a new scroll index wait until no scroll or momentum is in flight.
     private var scrollRebuildPending = false
     /// A scroll gesture (may-begin or scrolling) is open on the Mac, as shown by the phase of
     /// the last posted scroll frame.
@@ -94,34 +108,40 @@ public struct InjectorCore: Sendable {
     private var buttons: [PointerButton: Int64] = [:]
     private var lastFrame: TimeInterval = -.infinity
     private var lastUserActivity: TimeInterval = -.infinity
+    /// The iPad's key confirmation delay from its latest heartbeat; nil until one states it.
+    private var padKeyLead: Double?
+    /// Set by `synth` when a key posted a Mission Control toggle (the F3 key); the input or tick
+    /// that caused it hands it to the gesture map.
+    private var missionControlKeyPosted = false
 
     public init(settings: InjectorSettings = .init()) {
         self.settings = settings
-        keyboard = MacKeyboardModel(config: Self.keyboardConfig(settings, base: MacKeyboardConfig()))
+        keyboard = MacKeyboardModel(config: Self.keyboardConfig(settings, base: MacKeyboardConfig(), padKeyLead: nil))
         pointer = Self.makePointer(settings)
         scrollCurvesInUse = Self.scrollCurves(settings)
+        scrollIndexInUse = Self.scrollIndex(settings)
         scroll = Self.makeScroll(settings)
         swipeFingers = Self.swipeFingers(settings)
-        appExposeEnabled = settings.prefs.threeFingerSwipes
+        appExposeEnabled = settings.prefs.appExposeGesture
         gestures = GestureActionMap(swipeFingers: swipeFingers, appExposeEnabled: appExposeEnabled)
     }
 
     /// Applies new settings without dropping held keys, buttons or an open scroll.
     public mutating func update(settings new: InjectorSettings) {
         settings = new
-        let config = Self.keyboardConfig(new, base: keyboard.config)
+        let config = Self.keyboardConfig(new, base: keyboard.config, padKeyLead: padKeyLead)
         if config != keyboard.config { keyboard.config = config }
         pointer = Self.makePointer(new)
         scroll.natural = new.prefs.naturalScrolling
         scroll.basePtPerMM = Self.scrollBase(new)
         scroll.speedFactor = Self.scrollFactor(new)
-        if Self.scrollCurves(new) != scrollCurvesInUse {
+        if Self.scrollCurves(new) != scrollCurvesInUse || Self.scrollIndex(new) != scrollIndexInUse {
             scrollRebuildPending = true
             rebuildScrollIfIdle()
         }
-        if Self.swipeFingers(new) != swipeFingers || new.prefs.threeFingerSwipes != appExposeEnabled {
+        if Self.swipeFingers(new) != swipeFingers || new.prefs.appExposeGesture != appExposeEnabled {
             swipeFingers = Self.swipeFingers(new)
-            appExposeEnabled = new.prefs.threeFingerSwipes
+            appExposeEnabled = new.prefs.appExposeGesture
             gestures = GestureActionMap(swipeFingers: swipeFingers, appExposeEnabled: appExposeEnabled)
         }
     }
@@ -151,6 +171,7 @@ public struct InjectorCore: Sendable {
     /// the dead-man release. Call at `nextDeadline`.
     public mutating func tick(at now: TimeInterval, env: PointerEnvironment) -> [SynthEvent] {
         var events = synth(keyboard.advance(to: now, capsLockOn: env.capsLockOn), env: env)
+        noteMissionControlKey(at: now)
         if let due = scroll.nextDeadline, now >= due {
             events += scrollEvents(scroll.tick(at: now), env: env)
         }
@@ -205,8 +226,10 @@ public struct InjectorCore: Sendable {
                                  env: PointerEnvironment) -> [SynthEvent] {
         switch input {
         case let .key(code, down):
-            gestures.noteOtherInput(at: now)
-            return (down ? userActivity(at: now) : []) + key(code, down: down, senderTime: senderTime, at: now, env: env)
+            let events = (down ? userActivity(at: now) : []) + key(code, down: down, senderTime: senderTime, at: now, env: env)
+            // A key press may dismiss Mission Control (Escape); the Mission Control key toggles it.
+            if !noteMissionControlKey(at: now), down { gestures.noteOtherInput(at: now) }
+            return events
 
         case let .button(button, down, clickState):
             gestures.noteOtherInput(at: now)
@@ -224,7 +247,7 @@ public struct InjectorCore: Sendable {
             return events
 
         case let .motion(m):
-            gestures.noteOtherInput(at: now)
+            // Moving the pointer cannot close Mission Control, so it leaves the gesture map alone.
             let d = pointer.apply(dxMM: m.dx, dyMM: m.dy, speed: m.speed)
             let move = cursor.move(by: d.dx, dy: d.dy, env: env)
             let drag: PointerButton? = buttons[.left] != nil ? .left : (buttons[.right] != nil ? .right : nil)
@@ -280,7 +303,12 @@ public struct InjectorCore: Sendable {
                   !mappedDown.values.contains(mapped) else { return [] }
             code = mapped
         }
-        return synth(keyboard.key(code, down: down, senderTime: senderTime, at: now, capsLockOn: env.capsLockOn), env: env)
+        // A deck modifier (lazy, or tap-only once remapped) sends a lone tap's down and up
+        // together at the lift, so a Caps Lock it is remapped to cannot be timed from the gap.
+        let tapAtLift = down && code == MacKeyCode.capsLock && physical != code
+            && KeyCommitPipeline.modifierCodes.contains(physical)
+        return synth(keyboard.key(code, down: down, senderTime: senderTime, at: now, capsLockOn: env.capsLockOn,
+                                  capsTapAtLift: tapAtLift), env: env)
     }
 
     /// Releases what the Mac holds but the heartbeat does not; never presses, never changes
@@ -290,6 +318,11 @@ public struct InjectorCore: Sendable {
     /// deadline cannot toggle the lock later and the next tap is not swallowed.
     private mutating func reconcile(_ heartbeat: Heartbeat, senderTime: TimeInterval, at now: TimeInterval,
                                     env: PointerEnvironment) -> [SynthEvent] {
+        if let lead = heartbeat.keyConfirmDelay, lead.isFinite, lead >= 0, lead != padKeyLead {
+            padKeyLead = lead
+            let config = Self.keyboardConfig(settings, base: keyboard.config, padKeyLead: lead)
+            if config != keyboard.config { keyboard.config = config }
+        }
         let padHeld = Set(heartbeat.held)
         mappedDown = mappedDown.filter { padHeld.contains($0.key) }
         let stillHeld = Set(mappedDown.values)
@@ -342,6 +375,7 @@ public struct InjectorCore: Sendable {
                     strategy = resolve(f)
                     topRowHeld[f] = strategy
                 }
+                if down, !autorepeat, Self.togglesMissionControl(strategy, flags: flags) { missionControlKeyPosted = true }
                 events += perform(strategy, down: down, autorepeat: autorepeat, flags: flags)
             case let .setCapsLock(on):
                 events.append(.setCapsLock(on))
@@ -500,7 +534,30 @@ public struct InjectorCore: Sendable {
         guard scrollRebuildPending, !scrollOpen, !scroll.isMomentumActive else { return }
         scroll = Self.makeScroll(settings)
         scrollCurvesInUse = Self.scrollCurves(settings)
+        scrollIndexInUse = Self.scrollIndex(settings)
         scrollRebuildPending = false
+    }
+
+    /// Hands a Mission Control key toggle posted since the last call to the gesture map, so a
+    /// swipe down then closes Mission Control and a swipe up keeps it open. True when there was one.
+    @discardableResult
+    private mutating func noteMissionControlKey(at now: TimeInterval) -> Bool {
+        guard missionControlKeyPosted else { return false }
+        missionControlKeyPosted = false
+        gestures.noteMissionControlToggled(at: now)
+        return true
+    }
+
+    /// A top-row strategy that toggles Mission Control when pressed without Control, Option or
+    /// Command (with them the Mission Control key does other things, such as Show Desktop).
+    private static func togglesMissionControl(_ strategy: TopRowStrategy, flags: ModifierFlags) -> Bool {
+        guard flags.intersection([.control, .option, .command]).isEmpty else { return false }
+        switch strategy {
+        case .keyCode(let code, _): return code == missionControlKeyCode
+        case .hotKey(let id): return id == GestureActionMap.missionControlHotKey
+        case .openApplication(let path): return path.hasSuffix("/Mission Control.app")
+        case .aux, .none: return false
+        }
     }
 
     private static func gestureInput(_ g: WireGesture) -> GestureInput? {
@@ -513,7 +570,10 @@ public struct InjectorCore: Sendable {
         }
     }
 
-    private static func keyboardConfig(_ s: InjectorSettings, base: MacKeyboardConfig) -> MacKeyboardConfig {
+    /// `padKeyLead`, the iPad's own key confirmation delay from its heartbeats, wins over
+    /// `padKeyConfirmationDelay`.
+    private static func keyboardConfig(_ s: InjectorSettings, base: MacKeyboardConfig,
+                                       padKeyLead: Double?) -> MacKeyboardConfig {
         let prefs = s.prefs.clamped()
         var config = base
         config.fnKeysStandard = prefs.fnKeysStandard
@@ -521,6 +581,7 @@ public struct InjectorCore: Sendable {
         config.repeatInterval = prefs.keyRepeatInterval
         config.capsMode = s.capsMode
         config.fnTapAction = s.fnTapAction
+        config.capsSenderLead = padKeyLead ?? s.padKeyConfirmationDelay
         return config
     }
 
@@ -536,7 +597,16 @@ public struct InjectorCore: Sendable {
 
     private static func makeScroll(_ s: InjectorSettings) -> ScrollSynthesizer {
         ScrollSynthesizer(natural: s.prefs.naturalScrolling, basePtPerMM: scrollBase(s), speedFactor: scrollFactor(s),
-                          curves: scrollCurves(s))
+                          scrollIndex: scrollIndex(s), curves: scrollCurves(s))
+    }
+
+    /// The live scroll acceleration index when it is finite and within 0...3 (the range of the
+    /// Mac's acceleration tables), else the default.
+    private static func scrollIndex(_ s: InjectorSettings) -> Double {
+        guard let index = s.scrollIndexOverride, index.isFinite, (0.0...3.0).contains(index) else {
+            return ScrollSynthesizer.defaultScrollIndex
+        }
+        return index
     }
 
     private static func scrollBase(_ s: InjectorSettings) -> Double {

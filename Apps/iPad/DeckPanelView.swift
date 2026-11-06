@@ -15,7 +15,7 @@ struct DeckPanelView: View {
         NavigationStack {
             Form {
                 headerSection
-                if !model.isPaired { pairingSection }
+                if showsPairingSection { pairingSection }
                 macBookSection
                 typingSection
                 trackpadSection
@@ -50,19 +50,44 @@ struct DeckPanelView: View {
                 Text(headerDetail).font(.subheadline).foregroundStyle(.secondary)
             }
             .accessibilityElement(children: .combine)
-            // No "Pause input" button yet: PadModel has no pause that survives a touch (a disconnect
-            // reconnects on the next deck touch, so resting hands would end it at once). Input is paused
-            // while this panel is open; the lead tracks an additive PadModel.pauseInput().
+            if model.isInputPaused {
+                Button("Resume input") {
+                    model.resumeInput()
+                    model.isPanelPresented = false
+                }
+            } else if model.isConnected || model.isConnecting {
+                // Keeps the link; the deck ignores touches until Resume input or the settings gesture.
+                Button("Pause input") {
+                    model.pauseInput()
+                    model.isPanelPresented = false
+                }
+            }
             if model.isConnected || model.isConnecting {
                 Button("Disconnect", role: .destructive) { model.disconnect() }
             } else if model.isPaired {
                 Button("Connect") { model.connect() }
             }
         } footer: {
-            if model.isConnected || model.isConnecting {
-                Text("Input is paused while this panel is open. After Disconnect, touching the deck connects again.")
+            if model.isInputPaused || model.isConnected || model.isConnecting {
+                Text(headerFooter)
             }
         }
+    }
+
+    private var headerFooter: String {
+        let resume = usesTouchIDTrigger ? "hold Touch ID" : "hold two fingers on the left palm rest"
+        let pause = model.isInputPaused
+            ? "Input is paused until you tap Resume input or \(resume) on the deck; touching the deck does not resume it."
+            : "Input is paused while this panel is open. Pause input keeps it paused after you close the panel, until you \(resume)."
+        guard model.isConnected || model.isConnecting else { return pause }
+        return pause + " After Disconnect, touching the deck connects again."
+    }
+
+    /// The deck's settings gesture: holding Touch ID on the drawn deck, else the two-finger hold on the
+    /// left palm rest (as `PadRootView` words it).
+    private var usesTouchIDTrigger: Bool {
+        model.preferences.appearance.mode == .drawn
+            && (PanelTrigger(rawValue: model.preferences.panelTriggerRaw) ?? .touchIDHold) == .touchIDHold
     }
 
     private var headerDetail: String {
@@ -84,10 +109,30 @@ struct DeckPanelView: View {
         }
     }
 
-    // MARK: Pairing (unpaired only; the pairing card on the deck offers the same)
+    // MARK: Pairing (unpaired, needsRepair, macTooOld; the pairing card on the deck offers the same)
+
+    /// Unpaired, or a needsRepair / macTooOld episode (also after "Keep waiting" hid the card), so a
+    /// new key can always be pasted here.
+    private var showsPairingSection: Bool { !model.isPaired || model.pairingEpisode != nil }
+
+    private var pairingSectionTitle: String {
+        switch model.pairingEpisode?.kind {
+        case .needsRepair?: return "Pair again"
+        case .macTooOld?: return "Pair with another Mac"
+        case nil: return "Pair with your Mac"
+        }
+    }
 
     private var pairingSection: some View {
-        Section("Pair with your Mac") {
+        Section {
+            if model.isWaitingOutRepair {
+                Text("iKey keeps trying the stored key. If you reset pairing on the Mac, paste its new key here.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Button("Show the pairing card again") {
+                    model.stopWaitingForRepair()
+                    model.isPanelPresented = false
+                }
+            }
             Text(model.discoveryStatus).font(.footnote).foregroundStyle(.secondary)
             if !model.peers.isEmpty {
                 Picker("Mac", selection: $model.selectedPeerID) {
@@ -95,12 +140,16 @@ struct DeckPanelView: View {
                     ForEach(model.peers) { peer in Text(peer.name).tag(peer.id) }
                 }
             }
+            // No content type (never .password): the key stays device-only and must never be offered to
+            // Passwords / iCloud Keychain AutoFill or saving (amendment A2).
             SecureField("Paste the pairing key from your Mac", text: $model.pairingText)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
-                .textContentType(.password)
+                .submitLabel(.go)
+                .onSubmit { if model.canConnect { model.connect() } }
                 .accessibilityHint("64 hexadecimal characters, shown by iKey on the Mac.")
-            Button(model.isConnecting ? "Connecting…" : "Connect") { model.connect() }
+            // An automatic retry shows as "Connecting…" until a key is pasted, which may pre-empt it.
+            Button(model.isConnecting && !model.canConnect ? "Connecting…" : "Connect") { model.connect() }
                 .disabled(!model.canConnect)
             if let hint = model.connectionHint {
                 Text(hint).font(.footnote).foregroundStyle(.secondary)
@@ -114,6 +163,8 @@ struct DeckPanelView: View {
                 }
             }
             .disabled(model.isRefreshing || model.isConnecting)
+        } header: {
+            Text(pairingSectionTitle)
         }
     }
 
@@ -380,7 +431,7 @@ private struct PhotoModeSettings: View {
                     Label(importing ? "Importing photo…" : "Choose a photo", systemImage: "photo")
                 }
                 .disabled(importing)
-                Text("Use a straight-down photo of your MacBook's keyboard, palm rests and trackpad, cropped to the bottom half.")
+                Text("Use a straight-down photo of your MacBook's keyboard, palm rests and trackpad, cropped to the bottom half. Your first photo also switches Deck to Photo.")
                     .font(.footnote).foregroundStyle(.secondary)
                 if model.photo != nil {
                     Button("Remove imported photo", role: .destructive) { model.removePhoto() }

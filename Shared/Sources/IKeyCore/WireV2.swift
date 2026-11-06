@@ -146,9 +146,17 @@ public struct Heartbeat: Codable, Equatable, Sendable {
     public var buttons: [PointerButton]
     /// True while any contact is on the deck.
     public var active: Bool
+    /// Seconds between a key contact landing and the iPad posting a confirmed key's down: 0.045
+    /// with palm protection on, 0 with it off (`DeckInputEngine.keyConfirmationDelay(for:)`). The
+    /// Mac adds it back when it times a Caps Lock hold from sender times. Additive field (wire key
+    /// `confirm`, 0...0.25): encoded only when non-nil; nil (an older iPad) leaves the Mac's
+    /// value unchanged, and older Macs ignore it.
+    public var keyConfirmDelay: Double?
 
-    public init(seq: UInt32, held: [UInt16], buttons: [PointerButton], active: Bool) {
+    public init(seq: UInt32, held: [UInt16], buttons: [PointerButton], active: Bool,
+                keyConfirmDelay: Double? = nil) {
         self.seq = seq; self.held = held; self.buttons = buttons; self.active = active
+        self.keyConfirmDelay = keyConfirmDelay
     }
 }
 
@@ -332,6 +340,7 @@ private enum WireLimits {
     static let maxStringBytes = 64
     static let maxListCount = 32
     static let maxDisplayMM = 5000.0
+    static let maxKeyConfirmDelay = 0.25
 
     static func mergeable(dx: Double, dy: Double, dt: Double) -> Bool {
         abs(dx) <= maxMM && abs(dy) <= maxMM && dt <= maxDT
@@ -421,6 +430,9 @@ private extension PadMessage {
             try WireLimits.check(hb.held.count <= WireLimits.maxListCount
                 && hb.buttons.count <= WireLimits.maxListCount)
             try hb.held.forEach(WireLimits.checkKey)
+            if let delay = hb.keyConfirmDelay {
+                try WireLimits.check((0...WireLimits.maxKeyConfirmDelay).contains(delay)) // false for NaN
+            }
         case .legacy(let event):
             try event.validate()
         case .unknown(let kind):
@@ -467,7 +479,7 @@ private enum WireKey: String, CodingKey {
     case code, down, button, cs
     case dx, dy, dt, sp, ph, vx, vy, n
     case kind, fingers, dir
-    case seq, held, buttons, active
+    case seq, held, buttons, active, confirm
     case id, reason
     case mac, name, model, keyboard, displayMM, prefs, caps, asleep, tapOnly
     case echo, macT
@@ -601,7 +613,8 @@ private struct PadFrame: Codable {
             let hb = Heartbeat(seq: try c.decode(UInt32.self, forKey: .seq),
                                held: try c.decode([UInt16].self, forKey: .held),
                                buttons: try c.decode([PointerButton].self, forKey: .buttons),
-                               active: try c.decode(Bool.self, forKey: .active))
+                               active: try c.decode(Bool.self, forKey: .active),
+                               keyConfirmDelay: try c.decodeIfPresent(Double.self, forKey: .confirm))
             return .heartbeat(hb, t: try t())
         case .ping:
             return .ping(id: try c.decode(UInt32.self, forKey: .id), t: try t())
@@ -668,6 +681,7 @@ private struct PadFrame: Codable {
             try c.encode(hb.held, forKey: .held)
             try c.encode(hb.buttons, forKey: .buttons)
             try c.encode(hb.active, forKey: .active)
+            try c.encodeIfPresent(hb.keyConfirmDelay, forKey: .confirm)
         case .ping(let id, let t):
             try kind(.ping)
             try c.encode(t, forKey: .t)

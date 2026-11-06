@@ -69,9 +69,12 @@ final class ReceiverModel: ObservableObject {
     }
     @Published private(set) var connectedDeviceName: String? = nil
     @Published private(set) var capsMode: CapsMode
-    /// In 'Switches input source' mode: the system Caps Lock cannot be reached, so a long press
-    /// cannot toggle it (taps still switch the input source; amendment J).
+    /// In 'Switches input source' mode: the injector could not set the system Caps Lock, so a long
+    /// press cannot toggle it (taps still switch the input source; amendments J and K).
     @Published private(set) var capsHardwareUnavailable = false
+    /// A switch to a Korean/Chinese/Japanese input method had to use TISSelectInputSource because
+    /// the 'Select the previous input source' shortcut is off; the menu asks to turn it on.
+    @Published private(set) var inputSourceShortcutNeeded = false
     @Published private(set) var keychainProblem: String? = nil
     @Published private(set) var trackingIndexShown: Double
     /// "Use F1, F2, etc. keys as standard function keys" on this Mac (fnState).
@@ -89,7 +92,7 @@ final class ReceiverModel: ObservableObject {
     /// The Mac's own remapping layers as detected, without manual pairs, also while
     /// `applyKeyRemap` is off.
     @Published private(set) var detectedKeyRemap = KeyRemap()
-    /// The injector has finished its first remap read (`keyRemap` reflects the Mac).
+    /// The injector has finished its first remap read (`detectedKeyRemap` reflects the Mac).
     @Published private(set) var hasReadKeyRemap = false
     /// Mirror the Mac's key remapping (hidutil, Modifier Keys, Karabiner) and the manual pairs.
     @Published var applyKeyRemap: Bool {
@@ -217,8 +220,8 @@ final class ReceiverModel: ObservableObject {
     private var syncingLoginItem = false
 
     /// Sorted deck codes the iPad must type as taps only (from the effective remap). nil until
-    /// the remap is known, so MacState leaves the iPad's persisted set unchanged instead of
-    /// clearing it (amendment H).
+    /// the injector's first remap read finished, so MacState leaves the iPad's persisted set
+    /// unchanged instead of clearing it (amendments H and K).
     private var tapOnlyCodes: [UInt16]?
     /// The effective remap map the last tap-only codes were computed from.
     private var mirroredRemapMap: [UInt16: UInt16]?
@@ -249,9 +252,12 @@ final class ReceiverModel: ObservableObject {
 
         injector.onHeldInputChanged = { [weak self] held in self?.drive(.heldInputChanged(held)) }
         // Fires after the first remap read (also when it finds nothing) and on every change of
-        // the effective remap; the readings themselves come only from pollPreferences while
-        // listening (amendment J).
+        // the detected or effective remap, also for override changes before that read. The remap
+        // is read only from pollPreferences while listening (amendment J).
         injector.onKeyRemapChanged = { [weak self] _ in self?.keyRemapChanged() }
+        // The Mac's readings without a remap read (idle spawns no hidutil): the Caps Lock mode,
+        // the fn-tap action and top-row Try's hot keys follow this Mac before listening starts.
+        injector.setReadings(readings)
         applyKeyRemapOverride()
         injector.setTopRowChoices(topRowChoices.strategies())
         injector.setCapsModePreference(capsModePreference)
@@ -791,6 +797,7 @@ final class ReceiverModel: ObservableObject {
     /// (hidutil, Modifier Keys, Karabiner); idle, nothing is read (amendment J).
     private func slowPoll() {
         refreshPermission()
+        refreshCapsMode()
         refreshCapsHardware()
         if isListening { pollPreferences() }
     }
@@ -801,8 +808,6 @@ final class ReceiverModel: ObservableObject {
         // (hidutil, Modifier Keys, Karabiner are not part of MacReadings; amendment C). Equal
         // settings make the injector's rebuild a no-op; the remap read runs off-main.
         injector.apply(readings: fresh)
-        // The injector may only now have readings (none are handed over before listening, so
-        // idle spawns no hidutil): its caps mode can change although `fresh == readings`.
         refreshCapsMode()
         refreshCapsHardware()
         guard fresh != readings else { return }
@@ -834,11 +839,12 @@ final class ReceiverModel: ObservableObject {
     }
 
     /// The injector only falls back to virtual in `.system` mode; in `.switchesInputSource` a
-    /// failing hardware lock just loses the long-press toggle, which the menu says. An unreachable
-    /// IOHIDSystem lock state is the observable sign of it.
+    /// failed hardware set just loses the long-press toggle, which the menu says (amendment K).
     private func refreshCapsHardware() {
-        let unavailable = capsMode == .switchesInputSource && CapsLockHardware.read() == nil
+        let unavailable = capsMode == .switchesInputSource && injector.capsHardwareSetFailed
         if unavailable != capsHardwareUnavailable { capsHardwareUnavailable = unavailable }
+        let shortcutNeeded = injector.inputSourceShortcutNeeded
+        if shortcutNeeded != inputSourceShortcutNeeded { inputSourceShortcutNeeded = shortcutNeeded }
     }
 
     private func applyTuning() {
@@ -848,10 +854,11 @@ final class ReceiverModel: ObservableObject {
 
     // MARK: Key remap
 
-    /// Mirrors the injector's effective remap and resends MacState(tapOnly:) to a v2 iPad
-    /// whenever it changes. The codes are known once the first remap read finished, or at once
-    /// while mirroring is off (nothing is remapped then); from then on an empty set is sent
-    /// explicitly, clearing a stale persisted set on the iPad.
+    /// Publishes the injector's remaps on every call (the menu shows override changes at once),
+    /// but computes the tap-only codes and resends MacState(tapOnly:) to a v2 iPad only once the
+    /// first remap read finished (amendments H and K): before it, MacState carries nil so the
+    /// iPad keeps its persisted set. The first read always reports, so the first set is never
+    /// missed; from then on an empty set is sent explicitly, clearing a stale one on the iPad.
     private func keyRemapChanged() {
         let remap = injector.keyRemap
         if remap != keyRemap { keyRemap = remap }
@@ -859,14 +866,7 @@ final class ReceiverModel: ObservableObject {
         if detected != detectedKeyRemap { detectedKeyRemap = detected }
         let read = injector.hasReadKeyRemap
         if read != hasReadKeyRemap { hasReadKeyRemap = read }
-        if applyKeyRemap && !read {
-            // Mirroring turned on before the first read: the codes are unknown again, so MacState
-            // must not clear the iPad's saved set with the [] computed while mirroring was off.
-            tapOnlyCodes = nil
-            mirroredRemapMap = nil
-            return
-        }
-        guard remap.map != mirroredRemapMap else { return }
+        guard read, remap.map != mirroredRemapMap else { return }
         mirroredRemapMap = remap.map
         tapOnlyCodes = remap.tapOnlyPadCodes.sorted()
         activeV2Session?.stream.send([stateMessage()])

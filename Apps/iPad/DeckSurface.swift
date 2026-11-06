@@ -143,6 +143,8 @@ final class DeckTouchView: UIView {
     private var shownSequence = 0
     private var previewCommit: DispatchWorkItem?
     private var ringState: RingState = .hidden
+    /// A deferred `becomeFirstResponder` is queued (see `claimFirstResponderSoon`).
+    private var firstResponderClaimQueued = false
 
     private enum Look {
         static let previewCommitDelay: TimeInterval = 0.25
@@ -268,7 +270,41 @@ final class DeckTouchView: UIView {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        if window != nil { refreshGeometry() }
+        if window != nil {
+            refreshGeometry()
+            claimFirstResponderSoon()
+        }
+    }
+
+    // MARK: - First responder (iPadOS three-finger editing gestures)
+
+    /// Since iPadOS 13, UIKit turns three-finger gestures into editing commands app-wide (swipe left Undo,
+    /// swipe right Redo, double-tap Undo, tap the shortcut bar, pinches Copy/Cut/Paste) and cancels the
+    /// touches it claims, unless the responder chain from the first responder opts out. The deck forwards
+    /// those very shapes to the Mac (Spaces swipes, Look Up tap, three-finger drag), so it opts out and
+    /// holds first responder while its input is live. Only the input deck takes first responder, never a
+    /// preview such as the calibration canvas.
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
+
+    override var canBecomeFirstResponder: Bool { inputEnabled }
+
+    /// Takes first responder now. Only while input is live: that requires a live link with no panel,
+    /// Fit & Size or pairing card up, so no text field is being edited and none loses its keyboard.
+    private func claimFirstResponderIfLive() {
+        guard appliedMode == .live, window != nil, !isFirstResponder else { return }
+        _ = becomeFirstResponder()
+    }
+
+    /// Takes first responder after the current SwiftUI update or layout pass (`applyMode` runs inside
+    /// `updateUIView`), so the responder change never happens mid-update.
+    private func claimFirstResponderSoon() {
+        guard appliedMode == .live, !isFirstResponder, !firstResponderClaimQueued else { return }
+        firstResponderClaimQueued = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.firstResponderClaimQueued = false
+            self.claimFirstResponderIfLive()
+        }
     }
 
     override func willMove(toWindow newWindow: UIWindow?) {
@@ -354,6 +390,9 @@ final class DeckTouchView: UIView {
             let now = ProcessInfo.processInfo.systemUptime
             runEngine(at: now) { $0.setInputSuppressed(mode == .panelOnly) }
             flushOutputs()
+            // Back to live (link up, panel/Fit & Size closed, app active): hold first responder again
+            // before the next three-finger gesture, whatever took it meanwhile.
+            if mode == .live { claimFirstResponderSoon() }
         }
     }
 
@@ -380,6 +419,9 @@ final class DeckTouchView: UIView {
         guard !direct.isEmpty, !showRegions else { return }
         if appliedMode != .live { onTouchWhileDisabled?() }
         guard appliedMode != .off, engine != nil else { return }
+        // A touch event handler, not a SwiftUI update: reclaim synchronously, before UIKit's editing
+        // recognizer can recognise a three-finger shape that starts with this touch.
+        claimFirstResponderIfLive()
         for touch in direct.sorted(by: { $0.timestamp < $1.timestamp }) {
             nextTouchID += 1
             touchIDs[ObjectIdentifier(touch)] = nextTouchID
@@ -1128,7 +1170,7 @@ private enum SceneRenderer {
     }
 }
 
-private enum DeviceIdentity {
+enum DeviceIdentity {
     /// The `utsname.machine` identifier (e.g. "iPad16,5"); the simulated device's in the simulator.
     static let machineID: String = {
         #if targetEnvironment(simulator)

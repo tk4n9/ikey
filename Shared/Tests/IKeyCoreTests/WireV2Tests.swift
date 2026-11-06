@@ -439,6 +439,7 @@ final class WireV2Tests: XCTestCase {
         XCTAssertFalse(defaults.dragLock)
         XCTAssertTrue(defaults.tapToClick)
         XCTAssertTrue(defaults.threeFingerSwipes)
+        XCTAssertFalse(defaults.appExposeGesture)
         XCTAssertEqual(MacInputPreferences(), MacInputPreferences(keyRepeatDelay: 0.5))
         XCTAssertNoThrow(try defaults.validate())
 
@@ -447,6 +448,9 @@ final class WireV2Tests: XCTestCase {
         let partial = try decoder.decode(MacInputPreferences.self,
                                          from: Data(#"{"trackingIndex":1.5,"tapToClick":false,"future":1}"#.utf8))
         XCTAssertEqual(partial, MacInputPreferences(trackingIndex: 1.5, tapToClick: false))
+        // A peer that does not know the App Exposé flag leaves it at its default (off).
+        let exposeOn = try decoder.decode(MacInputPreferences.self, from: Data(#"{"appExposeGesture":true}"#.utf8))
+        XCTAssertEqual(exposeOn, MacInputPreferences(appExposeGesture: true))
         // Explicit null = key repeat off; absent = default.
         let off = try decoder.decode(MacInputPreferences.self, from: Data(#"{"keyRepeatDelay":null}"#.utf8))
         XCTAssertNil(off.keyRepeatDelay)
@@ -456,7 +460,7 @@ final class WireV2Tests: XCTestCase {
         let custom = MacInputPreferences(keyRepeatDelay: nil, keyRepeatInterval: 0.015, naturalScrolling: false,
                                          trackingIndex: 3, fnKeysStandard: true, doubleClickInterval: 5,
                                          threeFingerDrag: true, dragLock: true, tapToClick: false,
-                                         threeFingerSwipes: false)
+                                         threeFingerSwipes: false, appExposeGesture: true)
         XCTAssertNoThrow(try custom.validate())
         XCTAssertEqual(try decoder.decode(MacInputPreferences.self, from: JSONEncoder().encode(custom)), custom)
 
@@ -605,5 +609,40 @@ final class WireV2Tests: XCTestCase {
         XCTAssertEqual(TXTRecordKeys.macID, "id")
         XCTAssertEqual(WireV2.version, 2)
         XCTAssertEqual(WireFeature.all, ["macRepeat", "mmMotion", "scrollPhases", "gestures", "capsSync", "clickState"])
+    }
+
+    /// Regression: the heartbeat carries the iPad's key confirmation delay (0 with palm protection
+    /// off) so the Mac stops adding a fixed 45 ms to Caps Lock holds. Additive: absent when nil,
+    /// older frames without it still decode, and it must lie in 0...0.25.
+    func testHeartbeatKeyConfirmDelay() throws {
+        for delay in [0.0, 0.045, 0.25] {
+            let message = PadMessage.heartbeat(Heartbeat(seq: 2, held: [57], buttons: [], active: true,
+                                                         keyConfirmDelay: delay), t: 30)
+            XCTAssertEqual(try WireV2.decodeFromPad(try WireV2.encode(message)), message, "delay \(delay)")
+        }
+        XCTAssertEqual(try pad(#"{"v":2,"m":"hb","t":1,"seq":1,"held":[],"buttons":[],"active":true,"confirm":0}"#),
+                       .heartbeat(Heartbeat(seq: 1, held: [], buttons: [], active: true, keyConfirmDelay: 0), t: 1))
+        XCTAssertEqual(try pad(#"{"v":2,"m":"hb","t":1,"seq":1,"held":[],"buttons":[],"active":true}"#),
+                       .heartbeat(Heartbeat(seq: 1, held: [], buttons: [], active: true), t: 1))
+        let plain = try WireV2.encode(.heartbeat(Heartbeat(seq: 1, held: [], buttons: [], active: false), t: 1))
+        XCTAssertFalse(String(decoding: plain, as: UTF8.self).contains("confirm"))
+        let stated = try WireV2.encode(.heartbeat(Heartbeat(seq: 1, held: [], buttons: [], active: false,
+                                                            keyConfirmDelay: 0), t: 1))
+        XCTAssertTrue(String(decoding: stated, as: UTF8.self).contains(#""confirm":0"#))
+        for bad in [-0.001, 0.2501, .nan, .infinity] {
+            assertProtocolError(.invalidEvent, "confirm \(bad)") {
+                _ = try WireV2.encode(.heartbeat(Heartbeat(seq: 1, held: [], buttons: [], active: true,
+                                                           keyConfirmDelay: bad), t: 1))
+            }
+        }
+        assertProtocolError(.invalidEvent, "confirm 1 on decode") {
+            _ = try self.pad(#"{"v":2,"m":"hb","t":1,"seq":1,"held":[],"buttons":[],"active":true,"confirm":1}"#)
+        }
+        let protection = TouchProtectionSettings()
+        XCTAssertTrue(protection.enabled)
+        XCTAssertEqual(DeckInputEngine.keyConfirmationDelay(for: protection), 0.045)
+        var off = protection
+        off.enabled = false
+        XCTAssertEqual(DeckInputEngine.keyConfirmationDelay(for: off), 0)
     }
 }

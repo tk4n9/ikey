@@ -15,7 +15,8 @@ struct IKeyPadApp: App {
 
 /// The chrome-free root (F12). While healthy only the deck shows. Problems show as the Touch ID ring,
 /// a quiet hint above the function row and, when pairing is needed, the pairing card on the left palm
-/// rest. Settings open by holding Touch ID (or the deck's VoiceOver action), also while disconnected.
+/// rest. Settings open by holding Touch ID (or the deck's VoiceOver action), also while disconnected;
+/// after the panel's "Pause input" the same gesture resumes input instead.
 struct PadRootView: View {
     @ObservedObject var model: PadModel
     @ObservedObject var orientation: AppDelegate
@@ -29,13 +30,6 @@ struct PadRootView: View {
     @State private var surfaceProjection: ProjectionResolution?
     @State private var messageSince: Double?
     @State private var touchIDHintUntil: Double?
-    /// The pairing problem the card answers, kept through the automatic retries (`.connecting`,
-    /// `.awaitingWelcome`) that needsRepair and macTooOld make every 10 s, so the card, ring and hint
-    /// stay put while the user types a key. Use `pairingEpisode`, which is also right in the frame
-    /// the link state changes.
-    @State private var lastEpisode: PairingCard.Episode?
-    /// "Keep waiting" in needsRepair: hides the card for the rest of that repair episode.
-    @State private var keepWaiting = false
     /// The panel sheet is on screen (until its dismissal finishes).
     @State private var panelSheetUp = false
     /// Drives the Fit & Size cover, which appears only once the panel sheet is gone; input stays
@@ -68,6 +62,9 @@ struct PadRootView: View {
         .background(Color.black)
         .statusBarHidden()
         .persistentSystemOverlays(.hidden)
+        // Screen-edge gestures only. iPadOS's three-finger editing gestures (Undo/Redo HUD, shortcut bar,
+        // Copy/Cut/Paste pinches) are turned off by the deck itself: DeckTouchView holds first responder
+        // while input is live and returns `.none` for `editingInteractionConfiguration`.
         .defersSystemGestures(on: .all)
         .sheet(isPresented: $model.isPanelPresented, onDismiss: panelDismissed) {
             DeckPanelView(model: model, onFitAndSize: {
@@ -106,11 +103,6 @@ struct PadRootView: View {
                 fitCoverUp = true
             }
         }
-        .onChange(of: model.linkState, initial: true) { _, _ in lastEpisode = pairingEpisode }
-        .onChange(of: pairingEpisode?.kind, initial: true) { _, kind in
-            // Kept through the episode's retries; a new episode asks again.
-            if kind != .needsRepair { keepWaiting = false }
-        }
         .task(id: clockKey) { await runClock() }
     }
 
@@ -144,7 +136,14 @@ struct PadRootView: View {
             dimmed: model.isPanelPresented,
             keyboardGlow: model.keyboardGlowLevel,
             onInputs: { model.send($0, at: $1) },
-            onRequestPanel: { model.isPanelPresented = true },
+            onRequestPanel: {
+                // While input is paused, the settings gesture resumes it (deck touches never do).
+                if model.isInputPaused {
+                    model.resumeInput()
+                } else {
+                    model.isPanelPresented = true
+                }
+            },
             onHeldSnapshot: { model.updateHeldSnapshot(keys: $0, buttons: $1, active: $2) },
             onTouchWhileDisabled: { model.deckTouchedWhileDisconnected() },
             onProjectionResolved: { resolution in
@@ -180,20 +179,8 @@ struct PadRootView: View {
 
     private var isDrawn: Bool { model.preferences.appearance.mode == .drawn }
 
-    /// needsRepair or macTooOld, including the automatic retries those states make (the supervisor
-    /// goes through `.connecting`/`.awaitingWelcome` and back while its hold lasts). Ends on
-    /// `.connected`, `.unpaired`, `.replaced`, or `.backoff`, which the supervisor only enters once
-    /// the hold is gone (the stored key worked, or the Mac now advertises protocol 2).
-    private var pairingEpisode: PairingCard.Episode? {
-        switch model.linkState {
-        case .needsRepair, .macTooOld:
-            return PairingCard.Episode(linkState: model.linkState, status: model.status)
-        case .connecting, .awaitingWelcome, .suspended:
-            return lastEpisode
-        case .connected, .unpaired, .replaced, .backoff:
-            return nil
-        }
-    }
+    /// needsRepair or macTooOld, including the automatic retries those states make (kept by the model).
+    private var pairingEpisode: PairingEpisode? { model.pairingEpisode }
 
     /// Seconds since the link problem began; nil counts as long-standing.
     private var problemAge: Double { model.problemSince.map { clock - $0 } ?? .infinity }
@@ -209,7 +196,7 @@ struct PadRootView: View {
         if model.isPanelPresented || model.isFitPresented { return .paused }
         switch model.linkState {
         case .connected:
-            return isDeckGuarded ? .paused : .live
+            return isDeckGuarded || model.isInputPaused ? .paused : .live
         case .suspended:
             return .paused
         case .unpaired, .needsRepair, .macTooOld:
@@ -225,8 +212,8 @@ struct PadRootView: View {
         }
     }
 
-    /// The top-band hint: guards at once, the result of a pairing action briefly, link problems after
-    /// 5 s, and the scaled-drawing note while it applies.
+    /// The top-band hint: guards at once, the result of a pairing action briefly, how to resume while
+    /// input is paused, link problems after 5 s, and the scaled-drawing note while it applies.
     private var hintText: String? {
         if isDrawn, orientation.isRotatedAway {
             return orientation.interfaceOrientation.isPortrait
@@ -238,6 +225,7 @@ struct PadRootView: View {
            clock - since < Timing.messageHint {
             return message
         }
+        if model.isInputPaused, model.isConnected { return pausedHint }
         if let link = linkHint, problemAge >= Timing.problemHint { return link }
         if isDrawn, model.projection?.fit == .unknownDevice {
             return "This iPad isn't a 13-inch model — drawing is scaled"
@@ -271,7 +259,7 @@ struct PadRootView: View {
         case .needsRepair, .macTooOld, .connecting, .awaitingWelcome, .backoff:
             // Kept through the episode's retries and the card's own attempt, so its progress and
             // result show in place and a key being typed is not torn down.
-            if let episode = pairingEpisode { return !(episode.kind == .needsRepair && keepWaiting) }
+            if let episode = pairingEpisode { return !(episode.kind == .needsRepair && model.isWaitingOutRepair) }
             // A first pairing attempt (unpaired) keeps the card too.
             return !model.isPaired
         }
@@ -402,6 +390,12 @@ struct PadRootView: View {
             : "Hold two fingers on the left palm rest for iKey settings"
     }
 
+    private var pausedHint: String {
+        usesTouchIDTrigger
+            ? "Input paused — hold Touch ID to resume"
+            : "Input paused — hold two fingers on the left palm rest to resume"
+    }
+
     /// The colour of the surface behind the hint, 25 % HSL lightness away from it: darker, unless
     /// lighter contrasts more (Midnight, and dark finishes at night, where darker would vanish).
     private func hintColor(on backdrop: Backdrop) -> Color {
@@ -436,8 +430,7 @@ struct PadRootView: View {
         // The card covers the left palm rest, where the two-finger settings hold lives, so that
         // trigger gets a button on the card instead.
         let openSettings: (() -> Void)? = usesTouchIDTrigger ? nil : { model.isPanelPresented = true }
-        return PairingCard(model: model, episode: pairingEpisode,
-                           onKeepWaiting: { keepWaiting = true }, onSettings: openSettings)
+        return PairingCard(model: model, onSettings: openSettings)
             .frame(width: width, height: height)
             .position(x: x, y: y)
     }

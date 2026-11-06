@@ -143,6 +143,55 @@ final class CapsLockControllerTests: XCTestCase {
         XCTAssertEqual(c.up(senderTime: 5.7, at: 0.01, isOn: false), [.setCapsLock(true)])
     }
 
+    /// The sender stamps the down `senderLead` after the touch landed (the iPad's key
+    /// confirmation), so an up adds it back: thresholds count from the touch. The Mac-clock
+    /// deadline keeps the full threshold.
+    func testSenderLeadCountsHoldFromTouchDown() {
+        var c = CapsLockController(senderLead: 0.045)
+        _ = c.down(senderTime: 1.045, at: 0, isOn: false)
+        XCTAssertEqual(c.nextDeadline ?? -1, 0.075, accuracy: 1e-9)
+        XCTAssertEqual(c.up(senderTime: 1.10, at: 0.055, isOn: false), [.setCapsLock(true)])  // a 100 ms touch
+        _ = c.down(senderTime: 2.045, at: 1, isOn: false)
+        XCTAssertEqual(c.up(senderTime: 2.07, at: 1.025, isOn: false), [])                   // a 70 ms touch
+        // Without sender times the Mac clock decides, with no lead.
+        _ = c.down(senderTime: nil, at: 3, isOn: false)
+        XCTAssertEqual(c.up(senderTime: nil, at: 3.05, isOn: false), [])
+
+        var s = CapsLockController(mode: .switchesInputSource, senderLead: 0.045)
+        _ = s.down(senderTime: 5.045, at: 0, isOn: false)
+        XCTAssertEqual(s.up(senderTime: 5.47, at: 0.425, isOn: false), [.symbolicHotKey(60)])
+        _ = s.down(senderTime: 6.045, at: 1, isOn: false)
+        XCTAssertEqual(s.up(senderTime: 6.52, at: 1.475, isOn: false), [.setCapsLock(true)])
+
+        // A corrupt lead is clamped (negative/non-finite → none, at most 0.25 s).
+        let leads: [(TimeInterval, [KeyboardAction])] = [(-1, []), (.nan, []), (.infinity, []), (10, [.setCapsLock(true)])]
+        for (lead, expected) in leads {
+            var bad = CapsLockController(senderLead: lead)
+            _ = bad.down(senderTime: 1, at: 0, isOn: false)
+            XCTAssertEqual(bad.up(senderTime: 1.04, at: 0.04, isOn: false), expected, "lead \(lead)")
+        }
+    }
+
+    /// A key whose lone tap arrives as down+up at one sender instant (a deck modifier remapped
+    /// to Caps Lock) is a full press in .system and a tap in .switchesInputSource.
+    func testTapAtLiftIsAFullPressInSystemMode() {
+        var c = CapsLockController(senderLead: 0.045)
+        _ = c.down(senderTime: 1, at: 0, isOn: false, tapAtLift: true)
+        XCTAssertEqual(c.up(senderTime: 1, at: 0, isOn: false), [.setCapsLock(true)])
+        XCTAssertEqual(c.down(senderTime: 2, at: 1, isOn: true, tapAtLift: true), [.setCapsLock(false)])
+        XCTAssertEqual(c.up(senderTime: 2, at: 1, isOn: false), [])
+        // Timed (chorded) presses of the same key keep the normal threshold.
+        _ = c.down(senderTime: 3, at: 2, isOn: false, tapAtLift: true)
+        XCTAssertEqual(c.up(senderTime: 3.01, at: 2.01, isOn: false), [])
+        // Without the flag, a same-instant tap is a touch shorter than the confirmation: ignored.
+        _ = c.down(senderTime: 4, at: 3, isOn: false)
+        XCTAssertEqual(c.up(senderTime: 4, at: 3, isOn: false), [])
+
+        var s = CapsLockController(mode: .switchesInputSource, senderLead: 0.045)
+        _ = s.down(senderTime: 1, at: 0, isOn: false, tapAtLift: true)
+        XCTAssertEqual(s.up(senderTime: 1, at: 0, isOn: false), [.symbolicHotKey(60)])
+    }
+
     func testModeChangeAndResetDropState() {
         var c = CapsLockController(mode: .virtual)
         _ = c.down(senderTime: nil, at: 0, isOn: false)

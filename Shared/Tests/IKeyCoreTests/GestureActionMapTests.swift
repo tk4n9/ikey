@@ -14,13 +14,15 @@ final class GestureActionMapTests: XCTestCase {
         let right = try XCTUnwrap(SymbolicHotKeys(plist: nil).hotKey(81))
         XCTAssertEqual(right, HotKey(keyCode: 124, modifierMask: 0x840000, enabled: true))
         XCTAssertEqual(SymbolicHotKeys(plist: nil).hotKey(79)?.keyCode, 123)
-        // Other finger counts do nothing.
-        XCTAssertEqual(map.handle(.swipe(fingers: 4, direction: .left), at: 2), [])
+        // Fewer fingers do nothing; more fingers count too.
         XCTAssertEqual(map.handle(.swipe(fingers: 2, direction: .up), at: 2), [])
-        // With three-finger drag on, swipes move to four fingers.
+        XCTAssertEqual(map.handle(.swipe(fingers: 4, direction: .left), at: 2), [.hotKey(81)])
+        XCTAssertEqual(map.handle(.swipe(fingers: 5, direction: .right), at: 2), [.hotKey(79)])
+        // With three-finger drag on, swipes move to four fingers: three fingers drag.
         var four = GestureActionMap(swipeFingers: 4)
         XCTAssertEqual(four.handle(.swipe(fingers: 3, direction: .left), at: 0), [])
         XCTAssertEqual(four.handle(.swipe(fingers: 4, direction: .left), at: 0), [.hotKey(81)])
+        XCTAssertEqual(four.handle(.swipe(fingers: 5, direction: .left), at: 0), [.hotKey(81)])
     }
 
     func testUpThenDownClosesMissionControl() {
@@ -32,7 +34,7 @@ final class GestureActionMapTests: XCTestCase {
 
         // A gesture that maps to nothing does not count as another action.
         XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .up), at: 20), [.hotKey(32)])
-        XCTAssertEqual(map.handle(.swipe(fingers: 5, direction: .down), at: 21), [])
+        XCTAssertEqual(map.handle(.swipe(fingers: 2, direction: .down), at: 21), [])
         XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .down), at: 22), [.hotKey(32)])
 
         // Other input in between means Mission Control may already be gone.
@@ -40,10 +42,43 @@ final class GestureActionMapTests: XCTestCase {
         map.noteOtherInput(at: 31)
         XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .down), at: 32), [.hotKey(33)])
 
-        // So does another gesture action.
+        // So does a Look Up tap.
         XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .up), at: 40), [.hotKey(32)])
-        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .left), at: 41), [.hotKey(81)])
+        XCTAssertEqual(map.handle(.tap(fingers: 3), at: 41), [.hotKey(70)])
         XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .down), at: 42), [.hotKey(33)])
+    }
+
+    /// Regression: switching Spaces inside Mission Control leaves it open, so the swipe down
+    /// afterwards still closes it and a swipe up still keeps it open (Ctrl+Up toggles).
+    func testSpaceSwipesInsideMissionControlKeepItOpen() {
+        var map = GestureActionMap(appExposeEnabled: false)
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .up), at: 0), [.hotKey(32)])
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .left), at: 1), [.hotKey(81)])
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .right), at: 2), [.hotKey(79)])
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .up), at: 3), [])
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .left), at: 4), [.hotKey(81)])
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .down), at: 5), [.hotKey(32)])
+        // Closed: the next swipe down is App Exposé (off here), the next swipe up opens it.
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .down), at: 6), [])
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .up), at: 7), [.hotKey(32)])
+        // A four-finger swipe is the same gesture.
+        XCTAssertEqual(map.handle(.swipe(fingers: 4, direction: .down), at: 8), [.hotKey(32)])
+    }
+
+    /// Regression: Mission Control opened with its key (F3) is open too: a swipe down closes it and
+    /// a swipe up keeps it open. The key pressed while it is open closes it.
+    func testMissionControlKeyToggleIsTracked() {
+        var map = GestureActionMap(appExposeEnabled: false)
+        map.noteMissionControlToggled(at: 0)
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .down), at: 1), [.hotKey(32)])
+        map.noteMissionControlToggled(at: 2)
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .up), at: 3), [])
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .down), at: 4), [.hotKey(32)])
+        // Opened by a swipe, closed by the key: the next swipe up opens it again.
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .up), at: 10), [.hotKey(32)])
+        map.noteMissionControlToggled(at: 11)
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .down), at: 12), [])
+        XCTAssertEqual(map.handle(.swipe(fingers: 3, direction: .up), at: 13), [.hotKey(32)])
     }
 
     func testDownAfter15sIsAppExpose() {

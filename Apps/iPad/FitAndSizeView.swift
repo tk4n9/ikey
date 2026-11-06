@@ -7,7 +7,8 @@ import IKeyCore
 /// The true-scale check is the setup part: a drawn 200 mm and 150 mm ruler, an ID-1 card outline on the
 /// trackpad and the A→' and `→= key spans, all drawn through `model.projection`, the exact resolution
 /// the deck surface uses. Checking the position against a real MacBook (measured distances and the
-/// peek check) is optional and collapsed. Nudges go to `model.previewPlacement` at once and are
+/// peek check) is optional and collapsed; it needs the front-flush offset nudged in first, since the
+/// default placement is screen-centred. Nudges go to `model.previewPlacement` at once and are
 /// committed to `preferences.appearance.placement` 250 ms after the last change and on Done.
 struct FitAndSizeView: View {
     @ObservedObject var model: PadModel
@@ -149,6 +150,8 @@ struct FitAndSizeView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Optional. Open the lid. Lay iPad on the keyboard, screen up, front edge flush with the MacBook's front edge, and slide it until the aluminium strips on both sides look equal (about 11 mm).")
                 .font(.footnote)
+            Text(frontFlushHint).font(.footnote)
+            frontFlushButton
             Button("Position check…") { showPositionCheck = true }
             if let residual = positionResidualMM {
                 residualView(residual)
@@ -165,6 +168,25 @@ struct FitAndSizeView: View {
                 Button("Start peek check") { startPeek() }
                     .disabled(availablePeekShiftMM <= 0)
             }
+        }
+    }
+
+    /// The default deck is screen-centred, not front-flush: before comparing with the real MacBook
+    /// (and before Apply), the front-flush offset must be nudged in.
+    private var frontFlushHint: String {
+        let amount = frontFlushPlacement.map { Self.offsetText($0) } ?? "deck down about 5 mm on the 2022/2025 presets"
+        return "The deck is drawn screen-centred. Before comparing it with your MacBook or tapping Apply, "
+            + "nudge in the front-flush offset (\(amount)). Apply corrects only the difference between this "
+            + "preset and your MacBook, not where the iPad lies."
+    }
+
+    /// Nudges the front-flush offset in, keeping any correction an earlier Apply made.
+    @ViewBuilder private var frontFlushButton: some View {
+        if let flush = frontFlushPlacement {
+            let isIn = abs(positionBase.offsetXmm - flush.offsetXmm) < 0.005
+                && abs(positionBase.offsetYmm - flush.offsetYmm) < 0.005
+            Button(isIn ? "Front-flush offset is in" : "Nudge in the front-flush offset") { nudgeInFrontFlush(flush) }
+                .disabled(isIn || peekShiftMM > 0)
         }
     }
 
@@ -298,6 +320,8 @@ struct FitAndSizeView: View {
             Form {
                 Section {
                     Text("Measure these on your MacBook with a ruler before laying the iPad down.")
+                    Text(frontFlushHint).font(.footnote)
+                    frontFlushButton
                 }
                 Section("Distances") {
                     ForEach(ScaleCheck.referenceDistances(spec: spec), id: \.id) { ref in
@@ -317,6 +341,8 @@ struct FitAndSizeView: View {
                 }
                 Section {
                     Button("Apply", action: applyPositionCheck)
+                    Text("Apply replaces the correction of any earlier Apply. Nudges you made before or after it are kept.")
+                        .font(.footnote).foregroundStyle(.secondary)
                     if let positionMessage {
                         Text(positionMessage).foregroundStyle(.orange)
                     }
@@ -400,7 +426,7 @@ struct FitAndSizeView: View {
     }
 
     private func reset() {
-        positionRecord.base = nil
+        positionRecord.applied = nil
         positionRecord.save()
         positionResidualMM = nil
         cardVerdict = nil
@@ -427,18 +453,19 @@ struct FitAndSizeView: View {
         }
     }
 
-    /// The draft was clamped for the model in effect at start; re-clamp it so the readout, the peek
-    /// check and the drawn deck agree. An unedited draft is not committed (the stored placement stays
-    /// as it is and the resolver clamps it the same way); an edited one is previewed and committed.
+    /// The draft was clamped for the model in effect at start; clamp it for the new model so the
+    /// readout, the peek check and the drawn deck agree. An unedited draft is re-derived from the stored
+    /// placement (not committed: the resolver clamps the stored placement the same way, so switching
+    /// models back and forth never leaves the readout on an earlier model's clamp); an edited one is
+    /// previewed and committed.
     private func modelChanged(_ newModel: MacBookAirModel) {
         guard started, !ended else { return }
         // The slide was sized for the old model's range; the user starts the peek check again.
         peekShiftMM = 0
-        let clamped = draft.clamped(for: newModel)
         if edited {
-            setDraft(clamped)
+            setDraft(draft.clamped(for: newModel))
         } else {
-            draft = clamped
+            draft = model.preferences.appearance.placement.clamped(for: newModel)
             model.previewPlacement = nil
         }
     }
@@ -512,9 +539,19 @@ struct FitAndSizeView: View {
         positionRecord.save()
     }
 
-    /// Always starts from the placement in effect before the first Apply, so Apply is repeatable;
-    /// the current size is kept.
+    /// The placement without the shift of the last Apply: what the user placed by hand (nudges,
+    /// the front-flush offset, the peek check), before or after that Apply.
+    private var positionBase: DeckPlacement {
+        let shift = positionRecord.applied ?? .zero
+        return DeckPlacement(offsetXmm: draft.offsetXmm - shift.xMM, offsetYmm: draft.offsetYmm - shift.yMM,
+                             scale: draft.scale)
+    }
+
+    /// Takes the previous Apply's shift back out, then applies the new one, so Apply is repeatable
+    /// (the suggestion is relative) and nudges made before or after an earlier Apply are never lost.
+    /// The current size is kept. The stored shift is what actually moved (after clamping).
     private func applyPositionCheck() {
+        guard started, !ended else { return }
         let measured = parsedMeasurements()
         positionRecord.measured = measured
         guard !measured.isEmpty else {
@@ -523,13 +560,49 @@ struct FitAndSizeView: View {
             return
         }
         positionMessage = nil
-        let base = positionRecord.base ?? draft
-        positionRecord.base = base
-        positionRecord.save()
-        let current = DeckPlacement(offsetXmm: base.offsetXmm, offsetYmm: base.offsetYmm, scale: draft.scale)
-        let suggestion = ScaleCheck.suggestPlacement(spec: spec, measured: measured, current: current)
+        let base = positionBase
+        let suggestion = ScaleCheck.suggestPlacement(spec: spec, measured: measured, current: base)
         setDraft(DeckPlacement(offsetXmm: suggestion.offsetXmm, offsetYmm: suggestion.offsetYmm, scale: draft.scale))
+        positionRecord.applied = AppliedShift(xMM: Self.round(draft.offsetXmm - base.offsetXmm, 1_000_000),
+                                              yMM: Self.round(draft.offsetYmm - base.offsetYmm, 1_000_000))
+        positionRecord.save()
         positionResidualMM = suggestion.maxResidualMM
+    }
+
+    // MARK: Front-flush offset
+
+    /// The placement that draws the deck where it lies under an iPad laid front-flush on the MacBook and
+    /// centred left-right (the `.frontFlush` reference as offsets from the default screen-centred one);
+    /// nil when the iPad is not recognised.
+    private var frontFlushPlacement: DeckPlacement? {
+        guard let display = model.projection?.display ?? Self.detectedIPad() else { return nil }
+        let screen = Self.currentScreen()?.bounds.size
+        let size = screen.flatMap { $0.width > 0 && $0.height > 0 ? $0 : nil }
+            ?? CGSize(width: display.activeWidth * 10, height: display.activeHeight * 10)
+        let centred = DeckProjection(display: display, spec: spec, screenSize: size, reference: .screenCentred)
+        let flush = DeckProjection(display: display, spec: spec, screenSize: size, reference: .frontFlush)
+        return DeckPlacement(offsetXmm: Self.round(flush.screenCentreMM.x - centred.screenCentreMM.x, 100),
+                             offsetYmm: Self.round(flush.screenCentreMM.y - centred.screenCentreMM.y, 100))
+    }
+
+    /// Moves the hand-placed part of the deck to the front-flush offset, keeping an earlier Apply's
+    /// correction on top of it.
+    private func nudgeInFrontFlush(_ flush: DeckPlacement) {
+        let shift = positionRecord.applied ?? .zero
+        setDraft(DeckPlacement(offsetXmm: flush.offsetXmm + shift.xMM, offsetYmm: flush.offsetYmm + shift.yMM,
+                               scale: draft.scale))
+    }
+
+    /// "deck down 5.02 mm", in the readout's directions (+offsetY moves the deck down, +offsetX left).
+    private static func offsetText(_ placement: DeckPlacement) -> String {
+        var parts: [String] = []
+        if abs(placement.offsetYmm) >= 0.005 {
+            parts.append("deck \(placement.offsetYmm > 0 ? "down" : "up") \(mm(abs(placement.offsetYmm))) mm")
+        }
+        if abs(placement.offsetXmm) >= 0.005 {
+            parts.append("\(placement.offsetXmm > 0 ? "left" : "right") \(mm(abs(placement.offsetXmm))) mm")
+        }
+        return parts.isEmpty ? "none for this iPad" : parts.joined(separator: ", ")
     }
 
     // MARK: Helpers
@@ -537,8 +610,11 @@ struct FitAndSizeView: View {
     /// The iPad iKey recognises without an override: machine identifier first, then native pixels.
     private static func detectedIPad() -> IPadDisplaySpec? {
         if let display = IPadDisplaySpec.preset(forMachine: machineID) { return display }
-        let screen = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen }.first
-        return screen.flatMap { IPadDisplaySpec.detect(nativeLandscapePixels: $0.nativeBounds.size) }
+        return currentScreen().flatMap { IPadDisplaySpec.detect(nativeLandscapePixels: $0.nativeBounds.size) }
+    }
+
+    private static func currentScreen() -> UIScreen? {
+        UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen }.first
     }
 
     private static var machineID: String {
@@ -565,12 +641,21 @@ struct FitAndSizeView: View {
     }
 }
 
-/// Measured MacBook distances and the placement before the first Apply, stored as JSON under
-/// "iKey.positionCheck.v1".
+/// The offset shift the last position-check Apply made (after clamping), in deck mm.
+private struct AppliedShift: Codable, Equatable {
+    var xMM: Double
+    var yMM: Double
+
+    static let zero = AppliedShift(xMM: 0, yMM: 0)
+}
+
+/// Measured MacBook distances and the last Apply's shift, stored as JSON under "iKey.positionCheck.v1"
+/// (an older record's `base` key is ignored).
 private struct PositionCheckRecord: Codable, Equatable {
     var measured: [String: Double] = [:]
-    /// Every Apply starts from this placement (the suggestion is relative); Reset clears it.
-    var base: DeckPlacement?
+    /// The next Apply takes this back out of the current placement before applying its own shift (the
+    /// suggestion is relative), so hand nudges are kept; Reset clears it.
+    var applied: AppliedShift?
 
     private static let storageKey = "iKey.positionCheck.v1"
 

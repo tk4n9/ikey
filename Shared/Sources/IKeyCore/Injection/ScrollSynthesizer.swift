@@ -70,7 +70,11 @@ public struct ScrollSynthesizer: Sendable {
     private var remainderX = 0.0, remainderY = 0.0
     private var lastScrollInput: TimeInterval?
 
-    public init(natural: Bool = true, basePtPerMM: Double = 5.0, speedFactor: Double = 1.0, scrollIndex: Double = 0.6875,
+    /// The scroll acceleration index used when the Mac's own is unknown.
+    public static let defaultScrollIndex = 0.6875
+
+    public init(natural: Bool = true, basePtPerMM: Double = 5.0, speedFactor: Double = 1.0,
+                scrollIndex: Double = ScrollSynthesizer.defaultScrollIndex,
                 maxBoost: Double = 8, curves: [HIDAccelCurve] = HIDCurveTables.scroll) {
         self.natural = natural
         self.basePtPerMM = basePtPerMM

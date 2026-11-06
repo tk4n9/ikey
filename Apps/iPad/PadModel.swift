@@ -17,6 +17,17 @@ struct MacPeer: Identifiable {
     let macID: UUID?
 }
 
+/// A needsRepair or macTooOld problem. It is kept through the automatic retries those states make
+/// (`.connecting`/`.awaitingWelcome` every 10 s), a pasted-key Connect that pre-empts one of them, and
+/// trips through the background, so the pairing card, the panel's pairing section, the ring and the
+/// hint stay put while the user types a key.
+struct PairingEpisode: Equatable {
+    enum Kind: Equatable { case needsRepair, macTooOld }
+    var kind: Kind
+    /// `PadModel.status` when the problem was last seen (the card title and the top-band hint).
+    var status: String
+}
+
 extension SecureParameters {
     /// Offer the ECDHE-PSK suite; the integration pass flips it after the macOS loopback test.
     static let offerForwardSecrecyEnabled = false
@@ -34,7 +45,9 @@ final class PadModel: ObservableObject {
     /// moves, so views do not redraw for every message from the Mac.
     @Published private(set) var linkState: LinkState
     @Published private(set) var problemSince: Double?
-    @Published private(set) var macName: String?
+    @Published private(set) var macName: String? {
+        didSet { if macName != oldValue { refreshPairingEpisode() } }
+    }
     @Published private(set) var welcome: Welcome?
     @Published private(set) var macPrefs: MacInputPreferences?
     @Published private(set) var capsLockOn = false
@@ -44,8 +57,8 @@ final class PadModel: ObservableObject {
     @Published private(set) var rttP50: Double?
     @Published private(set) var rttP95: Double?
     /// Modifier key codes the live Mac's key remap makes tap-only (`MacState.tapOnly`); kept per Mac
-    /// across launches so the deck is right before the first state message.
-    @Published private(set) var macTapOnlyCodes: Set<UInt16> = []
+    /// across launches so the deck is right before the first state message. Read via `effectiveTyping`.
+    @Published private var macTapOnlyCodes: Set<UInt16> = []
     @Published var isPanelPresented = false {
         didSet { if isPanelPresented != oldValue { inputModeMayHaveChanged() } }
     }
@@ -56,9 +69,23 @@ final class PadModel: ObservableObject {
     @Published var previewPlacement: DeckPlacement?
     @Published private(set) var projection: ProjectionResolution?
     /// The Mac's last goodbye; kept across suspension, cleared by the next welcome.
-    @Published private(set) var lastGoodbye: GoodbyeReason?
+    @Published private(set) var lastGoodbye: GoodbyeReason? {
+        didSet { if lastGoodbye != oldValue { refreshPairingEpisode() } }
+    }
+    /// The needsRepair / macTooOld problem the pairing UI answers (see `PairingEpisode`); nil otherwise.
+    @Published private(set) var pairingEpisode: PairingEpisode?
+    /// "Keep waiting" during a needsRepair episode: the pairing card stays hidden while iKey keeps
+    /// retrying the stored key. Reversible (`stopWaitingForRepair()`, or pairing from the panel); ends
+    /// with the episode.
+    @Published private(set) var isWaitingOutRepair = false
+    /// "Pause input": the link stays up, but the deck stays at `.panelOnly` until `resumeInput()` (the
+    /// panel's Resume input, or the settings gesture on the deck). Deck touches never resume it. Not
+    /// persisted: a relaunch starts live.
+    @Published private(set) var isInputPaused = false {
+        didSet { if isInputPaused != oldValue { inputModeMayHaveChanged() } }
+    }
 
-    // Legacy members (pairing sheet, calibration, photo mode).
+    // Discovery, pairing, calibration and photo mode.
     @Published private(set) var peers: [MacPeer] = []
     @Published var selectedPeerID = ""
     /// Editing the key is a user action that answers a failed pairing's message.
@@ -79,13 +106,13 @@ final class PadModel: ObservableObject {
     @Published private var scenePhase: ScenePhase = .active
     /// Screen brightness below the Auto glow threshold.
     @Published private var lowLight = false
-    @Published private var unpairedSheetDismissed = false
 
     // MARK: Derived state
 
     var deckInputMode: DeckInputMode {
         if scenePhase == .background { return .off }
-        guard case .connected = linkState, !isPanelPresented, !isFitPresented, scenePhase == .active else {
+        guard case .connected = linkState, !isPanelPresented, !isFitPresented, !isInputPaused,
+              scenePhase == .active else {
             return .panelOnly
         }
         // Windowed or rotated scenes pause input. An unknown iPad keeps a usable scaled deck
@@ -125,8 +152,6 @@ final class PadModel: ObservableObject {
         }
     }
 
-    var inputEnabled: Bool { deckInputMode == .live }
-
     var isConnected: Bool {
         if case .connected = linkState { return true }
         return false
@@ -154,10 +179,14 @@ final class PadModel: ObservableObject {
         }
     }
 
+    /// A pasted key with a chosen Mac pairs; no key reconnects the paired Mac. A pasted key may
+    /// pre-empt an automatic attempt (a needsRepair / macTooOld retry, a reconnect), never the user's
+    /// own pairing attempt.
     var canConnect: Bool {
-        guard !isConnecting, !isConnected else { return false }
-        if isPaired && trimmedPairingText.isEmpty { return true }
-        return peers.contains(where: { $0.id == selectedPeerID }) && !trimmedPairingText.isEmpty
+        if isConnected { return false }
+        if trimmedPairingText.isEmpty { return isPaired && !isConnecting }
+        guard peers.contains(where: { $0.id == selectedPeerID }) else { return false }
+        return !isConnecting || attempt?.pairing == nil
     }
 
     var connectionHint: String? {
@@ -168,24 +197,9 @@ final class PadModel: ObservableObject {
         return nil
     }
 
-    /// The legacy root's sheet: the panel, or the pairing sheet while unpaired.
-    var isSettingsPresented: Bool {
-        get { isPanelPresented || (!isPaired && !unpairedSheetDismissed) }
-        set {
-            isPanelPresented = newValue
-            unpairedSheetDismissed = !newValue
-        }
-    }
+    var touchProtection: TouchProtectionSettings { preferences.protection }
 
-    var touchProtection: TouchProtectionSettings {
-        get { preferences.protection }
-        set { preferences.protection = newValue }
-    }
-
-    var showTouchIndicators: Bool {
-        get { preferences.showTouchIndicators }
-        set { preferences.showTouchIndicators = newValue }
-    }
+    var showTouchIndicators: Bool { preferences.showTouchIndicators }
 
     // MARK: Private state
 
@@ -228,7 +242,6 @@ final class PadModel: ObservableObject {
     private var browsingWanted = false
     private var discoveryTimeout: DispatchWorkItem?
     private var pairedEndpoint: NWEndpoint?
-    private var pairedMatchedByID = false
     /// TXT proto of the paired Mac's current advert; nil while it is not advertised.
     private var pairedAdvertProto: Int?
     private let pathMonitor = NWPathMonitor()
@@ -248,6 +261,9 @@ final class PadModel: ObservableObject {
     private var tapOnlyMacID: UUID?
 
     private var lastInputMode: DeckInputMode = .panelOnly
+    /// Set while `connect()` ends an automatic attempt to pair with a pasted key: the brief `.replaced`
+    /// that passes through must not end the pairing episode the user is answering.
+    private var keepsPairingEpisode = false
     private var loggedLegacyDrop = false
     private var brightnessObserver: NSObjectProtocol?
     private let store = PadStore()
@@ -373,11 +389,6 @@ final class PadModel: ObservableObject {
         }
     }
 
-    /// Legacy root: active / inactive only.
-    func sceneActiveChanged(_ active: Bool) {
-        scenePhaseChanged(active ? .active : .inactive)
-    }
-
     // MARK: User actions
 
     /// Pairs with the selected Mac using the pasted key, or reconnects the paired Mac when no key
@@ -409,8 +420,11 @@ final class PadModel: ObservableObject {
             return
         }
         message = nil
-        // Pairing is a deliberate switch: end any attempt or link in progress (the current Mac gets
-        // a `.user` goodbye) so the pasted key is used by this action, not by a later retry.
+        // Pairing is a deliberate switch: end any attempt or link in progress (an automatic retry
+        // included; the current Mac gets a `.user` goodbye) so the pasted key is used by this action,
+        // not by a later retry. The pairing episode being answered survives the brief park.
+        keepsPairingEpisode = true
+        defer { keepsPairingEpisode = false }
         switch supervisor.state {
         case .connecting, .awaitingWelcome, .connected:
             handle(.userDisconnect)
@@ -440,6 +454,7 @@ final class PadModel: ObservableObject {
     func forgetPairing() {
         pendingPairing = nil
         clearPairingFailure()
+        isInputPaused = false
         handle(.forgot)
         welcome = nil
         macPrefs = nil
@@ -468,15 +483,25 @@ final class PadModel: ObservableObject {
         startBrowser()
     }
 
-    func presentSettings() {
-        sendReleaseAll()
-        resetGeneration += 1
-        isPanelPresented = true
+    /// Keeps the link but stops all deck input until `resumeInput()`; held keys and buttons are
+    /// released at once (through `inputModeMayHaveChanged`).
+    func pauseInput() {
+        isInputPaused = true
     }
 
-    func settingsDismissed() {
-        resetGeneration += 1
-        inputModeMayHaveChanged()
+    func resumeInput() {
+        isInputPaused = false
+    }
+
+    /// "Keep waiting" on the pairing card: hide it while iKey keeps retrying the stored key.
+    func keepWaitingForRepair() {
+        guard pairingEpisode?.kind == .needsRepair else { return }
+        isWaitingOutRepair = true
+    }
+
+    /// Undoes "Keep waiting": the pairing card shows again.
+    func stopWaitingForRepair() {
+        isWaitingOutRepair = false
     }
 
     func saveLayout(_ draft: DeckLayout) throws {
@@ -488,10 +513,14 @@ final class PadModel: ObservableObject {
         message = nil
     }
 
+    /// The first photo (none was stored) also switches the deck to Photo; a replacement keeps the
+    /// mode the user chose.
     func importPhoto(_ data: Data) throws {
+        let isFirst = photo == nil
         photo = try store.savePhoto(data)
         pairingFailure = nil
         message = nil
+        if isFirst, preferences.appearance.mode != .photo { preferences.appearance.mode = .photo }
     }
 
     func removePhoto() {
@@ -521,6 +550,29 @@ final class PadModel: ObservableObject {
             linkState = state
         }
         if supervisor.problemSince != problemSince { problemSince = supervisor.problemSince }
+        refreshPairingEpisode()
+    }
+
+    /// Starts an episode in needsRepair / macTooOld (refreshing its wording), keeps it through the
+    /// retries, the background and a pasted-key Connect's park, and ends it on `.connected`,
+    /// `.unpaired`, `.replaced` or `.backoff`, which the supervisor enters only once its hold is gone
+    /// (the stored key worked, the Mac now advertises protocol 2, or the user disconnected or forgot).
+    private func refreshPairingEpisode() {
+        let next: PairingEpisode?
+        switch linkState {
+        case .needsRepair:
+            next = PairingEpisode(kind: .needsRepair, status: status)
+        case .macTooOld:
+            next = PairingEpisode(kind: .macTooOld, status: status)
+        case .connecting, .awaitingWelcome, .suspended:
+            next = pairingEpisode
+        case .replaced:
+            next = keepsPairingEpisode ? pairingEpisode : nil
+        case .connected, .unpaired, .backoff:
+            next = nil
+        }
+        if next != pairingEpisode { pairingEpisode = next }
+        if isWaitingOutRepair, next?.kind != .needsRepair { isWaitingOutRepair = false }
     }
 
     private func execute(_ command: LinkCommand, input: LinkInput, stateBefore: LinkState) {
@@ -567,7 +619,6 @@ final class PadModel: ObservableObject {
         pendingPairing = nil
         let chosenSecret: PairingSecret?
         let chosenEndpoint: NWEndpoint?
-        var matchedByID = false
         if let pairing {
             chosenSecret = pairing.secret
             chosenEndpoint = pairing.peer.endpoint
@@ -576,7 +627,6 @@ final class PadModel: ObservableObject {
             chosenSecret = pairedSecret
             if let pairedEndpoint {
                 chosenEndpoint = pairedEndpoint
-                matchedByID = pairedMatchedByID
             } else if let name = record?.lastServiceName, !name.isEmpty {
                 // Cold launch: resolve the remembered service instead of waiting for the browser.
                 chosenEndpoint = .service(name: name, type: IKeyService.bonjourType, domain: "local.", interface: nil)
@@ -597,7 +647,7 @@ final class PadModel: ObservableObject {
             secret: secret, peerToPeer: usedP2P, offerForwardSecrecy: SecureParameters.offerForwardSecrecyEnabled))
         let stream = PadLinkStream(connection: connection)
         let next = LinkAttempt(stream: stream, connection: connection, secret: secret, usedP2P: usedP2P,
-                               pairing: pairing, matchedByID: matchedByID)
+                               pairing: pairing)
         attempt = next
         connection.pathUpdateHandler = { [weak next] path in next?.note(path) }
         stream.onReady = { [weak self, weak next] in
@@ -620,7 +670,7 @@ final class PadModel: ObservableObject {
         let info = Bundle.main.infoDictionary
         let hello = Hello(proto: WireV2.version, client: clientID,
                           app: Self.wireString(info?["CFBundleShortVersionString"] as? String ?? "0"),
-                          device: Self.wireString(UIDevice.current.name),
+                          device: Self.wireString(Self.helloDeviceName),
                           features: WireFeature.all)
         attempt.helloSentAt = now
         attempt.stream.send([.hello(hello)])
@@ -667,8 +717,10 @@ final class PadModel: ObservableObject {
         } else {
             let host = old.remoteHost
             // A pasted key failing proves nothing about the stored key: never count it toward needsRepair.
+            // Only a host that completed a handshake before counts (docs/protocol.md): the Bonjour TXT
+            // `id` is unauthenticated, so an advert carrying the paired Mac's id proves nothing.
             let knownGood = old.pairing == nil
-                && (old.matchedByID || (host.map { record?.knownGoodHosts.contains($0) ?? false } ?? false))
+                && (host.map { record?.knownGoodHosts.contains($0) ?? false } ?? false)
             let authFailure = Self.isAuthFailure(reason, connection: old.connection)
             // A TLS alert or PSK mismatch proves the path reached the Mac: it is not evidence
             // against infrastructure Wi-Fi, so it must not push the policy back to P2P.
@@ -742,6 +794,11 @@ final class PadModel: ObservableObject {
                 current.macID = w.mac
             }
             current.macName = w.name
+            // The remembered service name follows only a Mac that proved the key, never an advert's
+            // unauthenticated TXT id alone.
+            if case .service(let name, _, _, _) = link.connection.endpoint, !name.isEmpty {
+                current.lastServiceName = name
+            }
             if let host = link.remoteHost { current.knownGoodHosts = Self.adding(host, to: current.knownGoodHosts) }
             if current != record { saveRecord(current) }
         }
@@ -758,12 +815,10 @@ final class PadModel: ObservableObject {
         // Reconnects go to the newly paired Mac, never to a previous Mac's Bonjour endpoint (the
         // browser is stopped while connected, so it cannot correct this before the next attempt).
         pairedEndpoint = peer.endpoint
-        pairedMatchedByID = peer.macID == w.mac
         pairedAdvertProto = nil
         pairedSecret = secret
         pairingText = ""
         isPaired = true
-        unpairedSheetDismissed = false
         handle(.paired)
     }
 
@@ -773,10 +828,8 @@ final class PadModel: ObservableObject {
         UserDefaults.standard.removeObject(forKey: Key.pairing)
         pairedSecret = nil
         pairedEndpoint = nil
-        pairedMatchedByID = false
         pairedAdvertProto = nil
         isPaired = false
-        unpairedSheetDismissed = false
         macName = nil
         if lastGoodbye == .unpaired { message = "Your Mac reset its pairing key. Paste the new key to pair again." }
     }
@@ -816,8 +869,11 @@ final class PadModel: ObservableObject {
         handle(.tick)
         guard let stream = liveStream else { return }
         let time = now
-        // 10% slack absorbs timer jitter against the 100 ms beat.
-        if time - lastHeartbeatAt >= (heldActive ? 0.1 : 1.0) * 0.9 {
+        // Anything held on the Mac (keys, buttons) or a contact on the deck beats every 100 ms: the
+        // Mac's 1 s dead-man releases held input after 1 s of silence, and a drag lock keeps the
+        // button down with no finger on the deck. 10% slack absorbs timer jitter against the beat.
+        let beatActive = heldActive || !heldKeys.isEmpty || !heldButtons.isEmpty
+        if time - lastHeartbeatAt >= (beatActive ? 0.1 : 1.0) * 0.9 {
             lastHeartbeatAt = time
             heartbeatSeq &+= 1
             let beat = Heartbeat(seq: heartbeatSeq, held: heldKeys.sorted(),
@@ -941,18 +997,15 @@ final class PadModel: ObservableObject {
 
         var paired: MacPeer?
         if let record {
-            if let byID = peers.first(where: { $0.macID == record.macID }) {
-                paired = byID
-                pairedMatchedByID = true
-                if byID.name != record.lastServiceName {
-                    var renamed = record
-                    renamed.lastServiceName = byID.name
-                    saveRecord(renamed)
-                }
-            } else {
-                paired = peers.first(where: { $0.macID == nil && $0.name == record.lastServiceName })
-                pairedMatchedByID = false
-            }
+            // The TXT `id` and `proto` are unauthenticated: when several adverts claim the paired Mac's
+            // id, prefer the remembered service name (mDNS keeps names unique on the link), then one that
+            // speaks v2, so a stray v1 or missing-proto advert cannot hold the deck in macTooOld while the
+            // real Mac is also advertised. The remembered name changes only after a welcome.
+            let byID = peers.filter { $0.macID == record.macID }
+            paired = byID.first(where: { $0.name == record.lastServiceName })
+                ?? byID.first(where: { $0.proto >= WireV2.version })
+                ?? byID.first
+                ?? peers.first(where: { $0.macID == nil && $0.name == record.lastServiceName })
         }
         if let paired { pairedEndpoint = paired.endpoint }
 
@@ -1100,6 +1153,16 @@ final class PadModel: ObservableObject {
         return value < 0 ? .min : .max
     }
 
+    /// The name the Mac shows for this iPad. Since iPadOS 16, `UIDevice.name` is the generic model
+    /// ("iPad") unless the app holds Apple's managed user-assigned-device-name entitlement, which iKey
+    /// does not; send the detected model ("iPad Pro 13-inch") instead. The client UUID stays the identity.
+    private static var helloDeviceName: String {
+        let name = UIDevice.current.name
+        guard name.isEmpty || name == UIDevice.current.model,
+              let spec = IPadDisplaySpec.preset(forMachine: DeviceIdentity.machineID) else { return name }
+        return spec.name.components(separatedBy: " (").first ?? spec.name
+    }
+
     /// The wire allows at most 64 UTF-8 bytes per string; cut on a character boundary.
     private static func wireString(_ text: String) -> String {
         var out = ""
@@ -1162,17 +1225,15 @@ private final class LinkAttempt {
     let usedP2P: Bool
     /// Set when this attempt pairs with a pasted key.
     let pairing: PendingPairing?
-    /// The endpoint came from a Bonjour result advertising the paired Mac's ID.
-    let matchedByID: Bool
     var helloSentAt: Double?
     var welcomed = false
     /// Remote IP without an interface scope, from the latest path.
     var remoteHost: String?
 
     init(stream: PadLinkStream, connection: NWConnection, secret: PairingSecret, usedP2P: Bool,
-         pairing: PendingPairing?, matchedByID: Bool) {
+         pairing: PendingPairing?) {
         self.stream = stream; self.connection = connection; self.secret = secret; self.usedP2P = usedP2P
-        self.pairing = pairing; self.matchedByID = matchedByID
+        self.pairing = pairing
     }
 
     func note(_ path: NWPath) {

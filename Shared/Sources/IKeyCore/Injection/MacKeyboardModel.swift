@@ -29,12 +29,16 @@ public struct MacKeyboardConfig: Equatable, Sendable {
     public var fnTapAction: FnTapAction = .none
     /// Longest fn press that still counts as a tap.
     public var fnTapMax: Double = 0.5
+    /// How long a key contact was already down when the sender stamped its down (the iPad's key
+    /// confirmation delay); Caps Lock adds it back to sender-timed holds. See `CapsLockController`.
+    public var capsSenderLead: Double = 0
 
     public init() {}
 
     public init(fnKeysStandard: Bool = false, repeatDelay: Double? = 0.5, repeatInterval: Double = 0.083,
                 lease: Double = 0.25, capsMode: CapsMode = .system, capsDelay: Double = 0.075,
-                capsSwitchHold: Double = 0.5, fnTapAction: FnTapAction = .none, fnTapMax: Double = 0.5) {
+                capsSwitchHold: Double = 0.5, fnTapAction: FnTapAction = .none, fnTapMax: Double = 0.5,
+                capsSenderLead: Double = 0) {
         self.fnKeysStandard = fnKeysStandard
         self.repeatDelay = repeatDelay
         self.repeatInterval = repeatInterval
@@ -44,6 +48,7 @@ public struct MacKeyboardConfig: Equatable, Sendable {
         self.capsSwitchHold = capsSwitchHold
         self.fnTapAction = fnTapAction
         self.fnTapMax = fnTapMax
+        self.capsSenderLead = capsSenderLead
     }
 }
 
@@ -102,7 +107,8 @@ public struct MacKeyboardModel: Sendable {
 
     public init(config: MacKeyboardConfig = .init()) {
         self.config = config
-        caps = CapsLockController(delay: config.capsDelay, mode: config.capsMode, switchHold: config.capsSwitchHold)
+        caps = CapsLockController(delay: config.capsDelay, mode: config.capsMode, switchHold: config.capsSwitchHold,
+                                  senderLead: config.capsSenderLead)
     }
 
     public var heldPhysicalCodes: Set<UInt16> { Set(held.keys) }
@@ -122,10 +128,12 @@ public struct MacKeyboardModel: Sendable {
         return flags
     }
 
+    /// `capsTapAtLift`: for a Caps Lock down, the sender posts this key's lone tap as a down and
+    /// an up together at its lift (see `CapsLockController.down`). Ignored for other keys and ups.
     public mutating func key(_ code: UInt16, down: Bool, senderTime: TimeInterval?, at now: TimeInterval,
-                             capsLockOn: Bool) -> [KeyboardAction] {
+                             capsLockOn: Bool, capsTapAtLift: Bool = false) -> [KeyboardAction] {
         frameReceived(at: now)
-        return down ? keyDown(code, senderTime: senderTime, at: now, capsLockOn: capsLockOn)
+        return down ? keyDown(code, senderTime: senderTime, at: now, capsLockOn: capsLockOn, capsTapAtLift: capsTapAtLift)
                     : keyUp(code, senderTime: senderTime, at: now, capsLockOn: capsLockOn)
     }
 
@@ -198,13 +206,13 @@ public struct MacKeyboardModel: Sendable {
     // MARK: - Private
 
     private mutating func keyDown(_ code: UInt16, senderTime: TimeInterval?, at now: TimeInterval,
-                                  capsLockOn: Bool) -> [KeyboardAction] {
+                                  capsLockOn: Bool, capsTapAtLift: Bool) -> [KeyboardAction] {
         guard held[code] == nil else { return [] }
         if code != MacKeyCode.fn { fnTap = nil }
 
         if code == MacKeyCode.capsLock {
             held[code] = .capsLock
-            let actions = caps.down(senderTime: senderTime, at: now, isOn: capsLockOn)
+            let actions = caps.down(senderTime: senderTime, at: now, isOn: capsLockOn, tapAtLift: capsTapAtLift)
             return withCurrentFlags(actions, capsLockOn: capsLockOn)
         }
         if MacKeyCode.modifiers.contains(code) {
@@ -347,5 +355,6 @@ public struct MacKeyboardModel: Sendable {
         caps.mode = config.capsMode
         caps.delay = config.capsDelay
         caps.switchHold = config.capsSwitchHold
+        caps.senderLead = config.capsSenderLead
     }
 }

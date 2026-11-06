@@ -36,7 +36,7 @@ Placement:                      (offset X, offset Y mm, size %; Reference = scre
 Resting fingers / Rest time:    (Home row, 0.30 s; isolated hold off)
 Palm protection / sensitivity:
 Wi-Fi connection setting / network: (Automatic, infrastructure or peer-to-peer)
-Key remap (Mac menu):           (e.g. Left ⌘ → Caps Lock, Caps Lock → Esc, from Karabiner)
+Key remap (Mac menu):           (e.g. Left ⌘ → Caps Lock, Caps Lock → Esc; from Karabiner-Elements)
 Caps Lock mode / Globe action:  (effective modes shown in the Mac menu)
 Top-row strategies:             (from Check Top-Row Keys: function → strategy or 'none')
 Deck check counts:              (only if the iPad lay on the MacBook)
@@ -79,13 +79,11 @@ Pass: all three are within 0.3 mm with Size within 0.99–1.01.
 
 ### G2 Position check (optional)
 
-This applies only if the iPad is actually laid on the MacBook. Before covering
-the keyboard, measure the four reference distances (see
-[true-scale setup](true-scale-setup.md#advanced-position-check-and-peek-check-optional)).
-First nudge in the front-flush offset (+5.29 mm Pro or +5.02 mm Air with the
-2022/2025 presets; see
-[true-scale setup](true-scale-setup.md#laying-the-ipad-on-the-macbook-optional)).
-Then enter the distances, press Apply once, and record the residual shown.
+This applies only if the iPad is actually laid on the MacBook. Follow
+[Compare with your MacBook](true-scale-setup.md#compare-with-your-macbook-optional):
+measure the four reference distances before covering the keyboard, lay the iPad
+front-flush, and tap **Nudge in the front-flush offset** (+5.29 mm Pro or
++5.02 mm Air with the 2022/2025 presets). Then enter the distances, press Apply once, and record the residual shown.
 Pass: ≤ 0.5 mm. The residual measures how well the preset agrees with your
 MacBook, not where the iPad lies; the peek check below and the drawn key edges
 against the real ones show the registration.
@@ -211,6 +209,14 @@ keyboard backend; it is not implemented.
 - **Pairing:** the correct key connects. A different 64-character key fails.
   Malformed text is rejected. A failed paste leaves a visible error, also when
   the iPad then reconnects to its previous Mac.
+- **Pairing again:** choose **New Key** on the Mac while iKey is closed on the
+  iPad, then open it. After about 60 s the iPad shows **Can't reach <Mac> — the
+  pairing key may have changed** with the pairing card. Tap **Keep waiting**,
+  then open the panel: its **Pair again** section shows the card again and also
+  takes the new key directly.
+- **Pause input:** in the panel tap **Pause input**. The link stays up, deck
+  touches post nothing, the Touch ID ring shows paused and the hint says how to
+  resume. Holding Touch ID (or the panel's **Resume input**) resumes.
 - **Keychain:** deny the Keychain prompt once. The menu shows the error with
   **Retry**, and no new key is created. After 20 relaunches of each app no key
   is pasted again.
